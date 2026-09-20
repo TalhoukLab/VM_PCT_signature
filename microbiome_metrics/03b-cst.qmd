@@ -1,0 +1,101 @@
+```{r}
+phylo_16s <- readRDS("16S/filtered_silva.rds")
+filtered_16s <- prune_samples(sample_data(phylo_16s)$control == "sample", phylo_16s)
+filtered_16s <- prune_taxa(taxa_sums(filtered_16s) > 0, filtered_16s)
+
+phylo_cpn60 <- readRDS("cpn60/filtered.rds")
+filtered_cpn60 <- prune_samples(sample_data(phylo_cpn60)$control == "sample", phylo_cpn60)
+filtered_cpn60 <- prune_taxa(taxa_sums(filtered_cpn60) > 0, filtered_cpn60)
+```
+
+```{r, fig.width=15, fig.height=8}
+library(phyloseq)
+library(microbiome)
+library(vegan)
+library(cluster)
+library(colorRamps)
+library(RColorBrewer)
+library(fpc)      
+library(dplyr)
+library(microViz)
+
+
+generate_CSTs <- function(phylo_obj, rank){
+
+  ps_genus <- phylo_obj %>%
+    tax_fix(unknowns = c("Clostridiales_bacterium")) %>%
+    tax_transform("identity", rank = rank) %>%
+    transform_sample_counts(function(x) x / sum(x))  # Already relative
+
+  dist_jsd <- phyloseq::distance(ps_genus, method = "bray")
+  pamk_result <- pamk(dist_jsd, krange = 2:4)
+  optimal_k <- pamk_result$nc  
+
+  pam_final <- pam(dist_jsd, k = optimal_k)
+  sample_data(ps_genus)$CST <- factor(pam_final$clustering)
+
+  df_cst <- psmelt(ps_genus)
+  colnames(df_cst) <- tolower(colnames(df_cst))
+
+  # Top taxa per CST
+  df_top1 <- df_cst %>%
+    group_by(cst, .data[[rank]]) %>%
+    summarise(mean_abund = mean(abundance), .groups = "drop") %>%
+    group_by(cst) %>%
+    slice_max(mean_abund, n = 1)
+
+  df_top <- df_top1 %>%
+    slice_max(mean_abund, n = 10) %>%
+    pull(.data[[rank]])
+
+  df_cst <- df_cst %>%
+    mutate(!!rank := if_else(.data[[rank]] %in% df_top,
+                             as.character(.data[[rank]]),
+                             "other"))
+
+  df_cst[[rank]] <- factor(df_cst[[rank]], 
+                           levels = c(setdiff(unique(df_cst[[rank]]), "other"), "other"))
+
+  n_taxa <- length(levels(df_cst[[rank]]))
+  palette_colors <- colorRampPalette(brewer.pal(12, "Set3"))(n_taxa)
+
+  a <- ggplot(df_cst, aes(x = cst, y = abundance, fill = .data[[rank]])) +
+    geom_bar(stat = "identity", position = "stack", color = NA, width = 0.9) + 
+    scale_fill_manual(values = palette_colors) +
+    theme_minimal() +
+    labs(
+      title = paste0("Defined Community State Types (k=", optimal_k, ") based on ", rank,
+                     " (Top 5 ", rank, " in Each CST)"),
+      x = "CST",
+      y = "Relative Abundance"
+    ) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.spacing = unit(0.1, "lines")  
+    )
+
+  res = list(phylo = ps_genus, plot = a, top = df_top1)
+  return(res)
+}
+
+
+
+csts_16S_genus <- generate_CSTs(phylo_obj = filtered_16s,rank =  "genus")
+csts_16S_species <- generate_CSTs(phylo_obj = filtered_16s,rank =  "species")
+csts_16S_species_MD <- data.frame(sample_data(csts_16S_species$phylo))
+csts_16S_species_MD <- csts_16S_species_MD %>% select(ID, CST)
+
+csts_cpn60_genus <- generate_CSTs(phylo_obj = filtered_cpn60,rank =  "genus")
+csts_cpn60_species <- generate_CSTs(phylo_obj = filtered_cpn60,rank =  "species")
+csts_cpn60_species_MD <- data.frame(sample_data(csts_cpn60_species$phylo))
+csts_cpn60_species_MD <- csts_cpn60_species_MD %>%
+                          mutate(CST = as.numeric(as.character(CST))) %>%
+                          mutate(CST = case_when(
+                            CST == 1 ~ 4,
+                            CST == 4 ~ 1,
+                            TRUE ~ CST))
+csts_cpn60_species_MD <- csts_cpn60_species_MD %>% select(ID, CST)
+
+csts_data <- left_join(csts_cpn60_species_MD, csts_16S_species_MD, by="ID", suffix = c("_cpn60", "_16S"))
+write.table(csts_data, "csts.csv", quote = F, row.names = F, sep = ",")
+```

@@ -1,0 +1,214 @@
+```{r}
+library(ANCOMBC)
+library(tidyverse)
+library(DT)
+library(phyloseq)
+library(microViz)
+```
+
+```{r}
+phylo_16s <- readRDS("16S/filtered_silva.rds")
+filtered_16s <- prune_samples(sample_data(phylo_16s)$control == "sample", phylo_16s)
+filtered_16s <- prune_samples(sample_data(filtered_16s)$pct != "No PCT", filtered_16s)
+filtered_16s <- prune_taxa(taxa_sums(filtered_16s) > 0, filtered_16s)
+
+phylo_cpn60 <- readRDS("cpn60/filtered.rds")
+filtered_cpn60 <- prune_samples(sample_data(phylo_cpn60)$control == "sample", phylo_cpn60)
+filtered_cpn60 <- prune_samples(sample_data(filtered_cpn60)$pct != "No PCT", filtered_cpn60)
+filtered_cpn60 <- prune_taxa(taxa_sums(filtered_cpn60) > 0, filtered_cpn60)
+```
+
+```{r}
+meta_data = microbiome::meta(filtered_16s)
+meta_data$pct = factor(meta_data$pct, levels = c("-PCT_1", "+PCT_1", "+PCT_2"))
+meta_data$hrt = factor(meta_data$hrt, levels = c("No", "Yes", "I prefer not to answer"))
+phyloseq::sample_data(filtered_16s) = meta_data
+
+meta_data_cpn60 = microbiome::meta(filtered_cpn60)
+meta_data_cpn60$pct = factor(meta_data_cpn60$pct, levels = c("-PCT_1", "+PCT_1", "+PCT_2"))
+meta_data_cpn60$hrt = factor(meta_data_cpn60$hrt, levels = c("No", "Yes", "I prefer not to answer"))
+phyloseq::sample_data(filtered_cpn60) = meta_data_cpn60
+```
+
+```{r}
+set.seed(123)
+
+run_ancombc <- function(phylo_obj, rank, prv_cut, lib_cut){
+  phylo_rank <- phylo_obj %>%
+            tax_fix(unknowns = c("Clostridiales_bacterium", "Porphyromonadaceae_bacterium", "Veillonellaceae_bacterium")) %>%
+            tax_transform("identity", rank = rank)
+  output = ancombc2(data = phylo_obj, tax_level = rank ,prv_cut = prv_cut,lib_cut = lib_cut,
+                  fix_formula = "pct + age + bmi_english", 
+                  group = "pct", 
+                  global = TRUE)
+  res_prim = output$res
+  
+  res_global = output$res_global
+  df_pct = res_prim %>%
+      dplyr::select(taxon, contains("pct")) 
+  df_fig_global = df_pct %>%
+      dplyr::left_join(res_global %>%
+                         dplyr::transmute(taxon, 
+                                          diff_pct = diff_abn)) %>%
+      dplyr::mutate(color = ifelse(diff_pct, "aquamarine3", "black")) %>%
+     dplyr::transmute(taxon,
+                      `+PCT_1 vs -PCT_1` = round(`lfc_pct+PCT_1`, 2),
+                      `+PCT_2 vs -PCT_1` = round(`lfc_pct+PCT_2`, 2),
+                      color = color) %>%
+      tidyr::pivot_longer(cols = `+PCT_1 vs -PCT_1`:`+PCT_2 vs -PCT_1`,
+                          names_to = "group", values_to = "value") %>%
+      dplyr::arrange(taxon)
+  
+  df_fig_global$group = factor(df_fig_global$group, 
+                               levels = c("+PCT_1 vs -PCT_1",
+                                          "+PCT_2 vs -PCT_1"))
+    
+  lo = floor(min(df_fig_global$value))
+  up = ceiling(max(df_fig_global$value))
+  mid = (lo + up)/2
+  fig_global = df_fig_global %>%
+    ggplot(aes(x = group, y = taxon, fill = value)) + 
+    geom_tile(color = "black") +
+    scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                         na.value = "white", midpoint = mid, limit = c(lo, up),
+                         name = NULL) +
+    geom_text(aes(group, taxon, label = value), color = "black", size = 4) +
+    labs(x = NULL, y = NULL, title = "Log fold changes for globally significant taxa") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.text.y = element_text(color = df_fig_global %>%
+                                         dplyr::distinct(taxon, color) %>%
+                                         .$color))
+  res = list(output = output, fig = fig_global)
+  return(res)
+}
+```
+
+```{r}
+generate_fig <- function(res, type, prv_cut, lib_cut, rank){
+  res <- res$output$res
+  df <- res %>%
+              select("taxon", starts_with("lfc"), starts_with("p_")) 
+  df <- df %>% pivot_longer(cols = -taxon,
+    names_to = c(".value", "variable"),
+    names_pattern = "(lfc|p)_(.*)")   %>%
+    mutate(
+      variable = gsub("p_", "", variable),
+      variable = gsub("pct", "", variable),
+      variable = gsub("bmi_english", "BMI", variable),
+      mlogp = -log10(p)) %>% filter(variable != "(Intercept)") 
+  df <- df %>%dplyr::filter(!is.na(lfc))
+
+  # order variables along x-axis
+  df$variable <- factor(df$variable, levels = unique(df$variable))
+  df <- df %>% filter(lfc > -9)
+
+  # plot
+  a <- ggplot(df, aes(x = variable, y = mlogp)) +
+    geom_jitter(aes(color = lfc), width = 0.25, height = 0) +
+  geom_text(data = df %>%
+        filter(abs(lfc) >=  1.5), aes(label = taxon),
+              color = "black", size = 4) + 
+    scale_color_gradient2(low = "blue", mid = "pink", high = "red", midpoint = 0) +
+    scale_alpha_manual(values = c(`TRUE` = 1, `FALSE` = 0.3)) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black", size = 1)+
+    labs(y = "-log10(p-value)", x = "",
+         title = paste0(prv_cut, " ", lib_cut, " ", type, " ", rank)) +
+    theme_bw(base_size = 12) +  theme(strip.text = element_text(face = "bold"),
+              axis.text.x = element_text(angle = 45, hjust = 1)) + xlab("")
+  return(a)
+}
+```
+
+## Running ANCOMBC with parameters 0.1, 900
+
+```{r}
+ancombc_res_16s <- run_ancombc(phylo_obj = filtered_16s, rank = "species", 
+                                prv_cut = 0.1, lib_cut = 900)
+
+res_16s <- ancombc_res_16s$output$res
+df_16s <- res_16s %>%
+            select("taxon", starts_with("lfc"), starts_with("p_")) 
+df_16s <- df_16s %>% pivot_longer(cols = -taxon,
+  names_to = c(".value", "variable"),
+  names_pattern = "(lfc|p)_(.*)")   %>%
+  mutate(
+    variable = gsub("p_", "", variable),
+    variable = gsub("pct", "", variable),
+    variable = gsub("bmi_english", "BMI", variable),
+    mlogp = -log10(p)) %>% filter(variable %in% c("+PCT_1", "+PCT_2")) 
+
+
+df_long_16s <- df_16s %>%
+  group_by(variable) %>%
+  mutate(sig = case_when(lfc > 0.5 ~ "Up",
+                        lfc < -0.5 ~ "Down",
+                        TRUE ~ "Not sig"))
+
+df_long_16s$type <- "16S rRNA"
+```
+
+```{r}
+ancombc_res_cpn60 <- run_ancombc(phylo_obj = filtered_cpn60, rank = "species", 
+                                prv_cut = 0.1, lib_cut = 900)
+
+res_cpn60 <- ancombc_res_cpn60$output$res
+df_cpn60 <- res_cpn60 %>%
+            select("taxon", starts_with("lfc"), starts_with("p_")) 
+df_cpn60 <- df_cpn60 %>% pivot_longer(cols = -taxon,
+  names_to = c(".value", "variable"),
+  names_pattern = "(lfc|p)_(.*)")   %>%
+  mutate(
+    variable = gsub("p_", "", variable),
+    variable = gsub("pct", "", variable),
+    variable = gsub("bmi_english", "BMI", variable),
+    mlogp = -log10(p)) %>% filter(variable %in% c("+PCT_1", "+PCT_2")) 
+
+
+df_long_cpn60 <- df_cpn60 %>%
+  group_by(variable) %>%
+  mutate(sig = case_when(lfc > 0.5 ~ "Up",
+                        lfc < -0.5 ~ "Down",
+                        TRUE ~ "Not sig"))
+df_long_cpn60$type <- "cpn60"
+```
+
+```{r}
+all <- rbind(df_long_16s, df_long_cpn60) %>% filter(lfc > -9)
+#all <- rbind(df_long_16s) %>% filter(lfc > -9)
+```
+
+```{r}
+
+b <- ggplot(all, aes(x = lfc, y = -log10(p), color = sig)) +
+  geom_point(alpha = 0.7, size = 3) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  geom_text(data = subset(all, (p < 0.05) | (abs(lfc) > 1)),
+          aes(label = taxon),
+          vjust = 1.5, size = 3, check_overlap = TRUE) +
+  facet_grid(~type) +
+  scale_color_manual(values = c("Up" = "red", "Down" = "blue", "Not sig" = "grey")) +
+  theme_bw(base_size = 20) +
+  labs(x = "Log Fold Change",y = "-log10(p-value)",color = "Abundance") +
+  theme(
+        strip.text = element_text(face = "bold"),
+        legend.position = "bottom")
+```
+
+```{r}
+a <- ggplot(all, aes(x = lfc, y = -log10(p), color = sig)) +
+  geom_point(alpha = 0.7, size = 3) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  geom_text(data = subset(all, (p < 0.05) | (abs(lfc) > 1)),
+          aes(label = taxon),
+          vjust = 1.5, size = 5, check_overlap = TRUE) +
+  facet_grid(type~variable) +
+  scale_color_manual(values = c("Up" = "red", "Down" = "blue", "Not sig" = "grey")) +
+  theme_bw(base_size = 20) +
+  labs(x = "Log Fold Change",y = "-log10(p-value)",color = "Abundance") +
+  theme(strip.background = element_rect(fill = "white", color = NA),
+        strip.text = element_text(face = "bold"),
+        legend.position = "bottom")
+```

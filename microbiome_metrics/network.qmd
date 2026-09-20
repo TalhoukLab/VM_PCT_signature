@@ -1,0 +1,199 @@
+```{r}
+library(tidyverse)
+library(caret)       
+library(glmnet)
+library(pROC)
+library(phyloseq)
+```
+
+```{r}
+phylo_16s <- readRDS("16S/filtered_silva.rds")
+filtered_16s <- prune_samples(sample_data(phylo_16s)$control == "sample", phylo_16s)
+filtered_16s <- prune_samples(sample_data(filtered_16s)$pct %in% c("+PCT_1", "-PCT_1", "+PCT_2"), filtered_16s)
+filtered_16s <- prune_taxa(taxa_sums(filtered_16s) > 0, filtered_16s)
+
+unfiltered_16S <- readRDS("16S/unfiltered_silva.rds")
+unfiltered_16S <- prune_samples(sample_data(unfiltered_16S)$control == "sample", unfiltered_16S)
+unfiltered_16S <- prune_samples(sample_data(unfiltered_16S)$pct %in% c("+PCT_1", "-PCT_1", "+PCT_2"), unfiltered_16S)
+
+
+phylo_cpn60 <- readRDS("cpn60/filtered.rds")
+filtered_cpn60 <- prune_samples(sample_data(phylo_cpn60)$control == "sample", phylo_cpn60)
+filtered_cpn60 <- prune_samples(sample_data(filtered_cpn60)$pct %in% c("+PCT_1", "-PCT_1", "+PCT_2"), filtered_cpn60)
+filtered_cpn60 <- prune_taxa(taxa_sums(filtered_cpn60) > 0, filtered_cpn60)
+
+unfiltered_cpn60 <- readRDS("cpn60/unfiltered.rds")
+unfiltered_cpn60 <- prune_samples(sample_data(unfiltered_cpn60)$control == "sample", unfiltered_cpn60)
+unfiltered_cpn60 <- prune_samples(sample_data(unfiltered_cpn60)$pct %in% c("+PCT_1", "-PCT_1", "+PCT_2"), unfiltered_cpn60)
+```
+
+```{r}
+library(phyloseq)
+library(dplyr)
+library(Hmisc)
+library(igraph)
+library(ggraph)
+library(ggplot2)
+library(patchwork)
+library(RColorBrewer)
+
+cor_threshold <- 0.5
+p_threshold <- 0.05
+top_n <- 25
+
+
+datasets <- list(`16S` = filtered_16s, cpn60 = filtered_cpn60)
+network_plots <- list()
+phylum_map <- list() 
+
+ps_genus_list <- list()
+all_top_genera <- c()
+
+for(ds_name in names(datasets)){
+  ps <- datasets[[ds_name]]
+  ps_genus <- tax_glom(ps, taxrank = "species")
+  
+  # Extract taxonomy table
+  tax <- as.data.frame(tax_table(ps_genus))
+  rownames(tax) <- taxa_names(ps_genus)
+  
+  # Replace taxa names with genus & store phylum mapping
+  if ("species" %in% colnames(tax) && any(!is.na(tax$genus) & tax$genus != "")) {
+    # Store mapping: Genus -> Phylum
+    for(i in 1:nrow(tax)){
+      phylum_map[[as.character(tax$genus[i])]] <- as.character(tax$phylum[i])
+    }
+    taxa_names(ps_genus) <- as.character(tax$genus)
+  } else {
+    warning(paste("Genus names missing for dataset:", ds_name, ". Using original taxa names."))
+  }
+  
+  ps_genus <- prune_taxa(taxa_sums(ps_genus) > 0, ps_genus)
+  
+  # Top N genera
+  genus_means <- taxa_sums(ps_genus) / nsamples(ps_genus)
+  top_genera <- names(sort(genus_means, decreasing = TRUE))[1:min(top_n, length(genus_means))]
+  ps_genus <- prune_taxa(top_genera, ps_genus)
+  
+  ps_genus_list[[ds_name]] <- ps_genus
+  all_top_genera <- union(all_top_genera, taxa_names(ps_genus))
+}
+
+# Remove any genera not in the final 'all_top_genera' set from the phylum map
+phylum_map <- phylum_map[names(phylum_map) %in% all_top_genera]
+all_phyla <- unique(unlist(phylum_map, use.names = FALSE))
+all_phyla <- all_phyla[!is.na(all_phyla)] # Remove NA phyla
+
+# ---- 2. Define consistent PHYLUM color palette ----
+num_phyla <- length(all_phyla)
+phylum_colors <- c()
+
+if (num_phyla > 0) {
+  # Use RColorBrewer for up to 12 distinct colors (Set3)
+  if (num_phyla <= 12) {
+    phylum_colors <- RColorBrewer::brewer.pal(n = max(3, num_phyla), name = "Set3")[1:num_phyla]
+  } else {
+    # Use a color-blind friendly palette (e.g., Viridis or scales::hue_pal) for more than 12
+    # scales::hue_pal() gives a good spread of colors
+    phylum_colors <- scales::hue_pal(l = 60, c = 100)(num_phyla)
+  }
+  phylum_colors <- setNames(phylum_colors, all_phyla)
+}
+
+# ---- 3. Fixed layout for all genera ----
+g_all <- graph_from_data_frame(
+  data.frame(from = character(), to = character()),
+  vertices = data.frame(name = all_top_genera),
+  directed = FALSE
+)
+if (vcount(g_all) > 1) { 
+  layout_coords <- layout_with_fr(g_all)
+  rownames(layout_coords) <- all_top_genera
+} else if (vcount(g_all) == 1) {
+  layout_coords <- matrix(c(0, 0), nrow = 1, ncol = 2, dimnames = list(all_top_genera, c("x", "y")))
+} else {
+  layout_coords <- matrix(numeric(0), nrow = 0, ncol = 2) 
+}
+
+
+# ---- 4. Loop through datasets and PCT levels ----
+for(ds_name in names(ps_genus_list)){
+  ps_genus <- ps_genus_list[[ds_name]]
+  pct_levels <- sort(unique(sample_data(ps_genus)$pct))
+  
+  for(pct_val in pct_levels){
+    ps_sub <- subset_samples(ps_genus, pct == pct_val)
+    ps_sub <- prune_samples(sample_sums(ps_sub) > 0, ps_sub)
+    
+    if (ntaxa(ps_sub) == 0 || nsamples(ps_sub) == 0) {
+      message(paste("Skipping network for", ds_name, "PCT =", pct_val, "due to no taxa or samples."))
+      next
+    }
+    
+    mat <- as.data.frame(otu_table(ps_sub))
+    present_genera <- colnames(mat)
+    
+    # Correlations (same as before)
+    if(length(present_genera) >= 2 && ncol(mat) >= 2 && nrow(mat) >= 2){ 
+      cor_res <- Hmisc::rcorr(as.matrix(mat), type = "spearman")
+      cor_mat <- cor_res$r
+      p_mat <- cor_res$P
+      
+      edges <- as.data.frame(as.table(cor_mat)) %>%
+        rename(Genus1 = Var1, Genus2 = Var2, Cor = Freq) %>%
+        mutate(p = as.vector(p_mat),
+               sign = ifelse(Cor > 0, "positive", "negative")) %>%
+        filter(Genus1 != Genus2,
+               abs(Cor) >= cor_threshold,
+               p <= p_threshold)
+    } else {
+      edges <- data.frame(Genus1=character(), Genus2=character(), Cor=numeric(), p=numeric(), sign=character())
+    }
+    
+    # Graph with all nodes
+    g <- graph_from_data_frame(edges, vertices = data.frame(name = all_top_genera), directed = FALSE)
+    
+    # Node metadata
+    V(g)$present <- V(g)$name %in% present_genera
+    V(g)$genus <- V(g)$name
+    V(g)$phylum <- unlist(lapply(V(g)$name, function(gen) phylum_map[[gen]]))
+    
+    # Layout
+    if (nrow(layout_coords) > 0 && all(V(g)$name %in% rownames(layout_coords))) {
+      g_coords <- layout_coords[V(g)$name, , drop = FALSE]
+      rownames(g_coords) <- NULL
+    } else {
+      g_coords <- layout_with_fr(g)
+    }
+    
+    # Plot
+    p <- ggraph(g, layout = "manual", x = g_coords[,1], y = g_coords[,2]) +
+      geom_edge_link(aes(color = sign, edge_alpha = abs(Cor)), width = 1) + 
+      # Set names for the edge scales to facilitate collection
+      scale_edge_color_manual(values = c(positive="lightblue", negative="red"), name = "Sign") +
+      
+      # *** FIX: Manually define breaks for the alpha legend ***
+      scale_edge_alpha_continuous(
+        name = "abs(Cor)", 
+        breaks = c(cor_threshold, 0.75, 1.0), # Example: show the threshold, 0.75, and max (1.0)
+        limits = c(cor_threshold, 1.0)        # Explicitly set the range
+      ) + 
+      
+      # Node scale definitions
+      geom_node_point(aes(color = phylum, alpha = present), size = 7) +
+      scale_color_manual(values = phylum_colors, name = "Phylum", drop = FALSE) +
+      scale_alpha_manual(values = c(`TRUE`=1, `FALSE`=0.3), name = "Present") +
+      geom_node_text(aes(label = genus), repel = TRUE, size = 6) +
+      theme_void(base_size = 20) +
+      ggtitle(paste(ds_name, "Genus-level Network — PCT =", pct_val))
+    
+    network_plots[[paste(ds_name, pct_val, sep="_")]] <- p
+  }
+}
+
+# Combine all plots
+final_plot <- patchwork::wrap_plots(network_plots, guides="collect") & 
+  theme(legend.position="bottom")
+
+
+```

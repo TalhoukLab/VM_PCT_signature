@@ -1,0 +1,581 @@
+```{r}
+library(tidyverse)
+library(caret)       
+library(glmnet)
+library(pROC)
+library(phyloseq)
+library(vip)
+library(microViz)
+library(mice)
+```
+
+```{r}
+phylo_cpn60 <- readRDS("cpn60/filtered.rds")
+filtered_cpn60 <- prune_samples(sample_data(phylo_cpn60)$control == "sample", phylo_cpn60)
+filtered_cpn60 <- prune_taxa(taxa_sums(filtered_cpn60) > 0, filtered_cpn60)
+
+unfiltered_cpn60 <- readRDS("cpn60/unfiltered.rds")
+unfiltered_cpn60 <- prune_samples(sample_data(unfiltered_cpn60)$control == "sample", unfiltered_cpn60)
+
+phylo_16s <- readRDS("16S/filtered_silva.rds")
+filtered_16s <- prune_samples(sample_data(phylo_16s)$control == "sample", phylo_16s)
+filtered_16s <- prune_taxa(taxa_sums(filtered_16s) > 0, filtered_16s)
+
+unfiltered_16S <- readRDS("16S/unfiltered_silva.rds")
+unfiltered_16S <- prune_samples(sample_data(unfiltered_16S)$control == "sample", unfiltered_16S)
+```
+
+```{r}
+library(phyloseq)
+library(tidyverse)
+
+ps_species <- tax_glom(filtered_16s, "species")
+ps_genus   <- tax_glom(filtered_16s, "genus")
+
+species_level_genera <- c("Lactobacillus", "Gardnerella", "Atopobium", "Sneathia", "Prevotella")
+
+tax_sp  <- as.data.frame(tax_table(ps_species))
+otu_sp  <- apply(otu_table(ps_species), 2, as.numeric)
+rownames(otu_sp) <- rownames(otu_table(ps_species))
+
+tax_sp$valencia_name <- mapply(function(genus, species) {
+  if (is.na(genus)) return(NA)
+  if (!genus %in% species_level_genera) return(NA)  
+  if (genus == "Prevotella") return("g_Prevotella")  
+  if (!is.na(species)) return(gsub(" ", "_", trimws(species)))
+  return(NA)
+}, tax_sp$genus, tax_sp$species)
+
+keep_sp <- !is.na(tax_sp$valencia_name)
+otu_sp_sub <- otu_sp[, keep_sp, drop = FALSE]
+colnames(otu_sp_sub) <- tax_sp$valencia_name[keep_sp]
+
+otu_sp_agg <- as.data.frame(t(rowsum(t(otu_sp_sub), group = colnames(otu_sp_sub))))
+
+cat("Species-level taxa:\n")
+print(colnames(otu_sp_agg))
+
+tax_gn  <- as.data.frame(tax_table(ps_genus))
+otu_gn  <- apply(otu_table(ps_genus), 2, as.numeric)
+rownames(otu_gn) <- rownames(otu_table(ps_genus))
+
+tax_gn$valencia_name <- mapply(function(genus) {
+  if (is.na(genus)) return(NA)
+  if (genus %in% species_level_genera) return(NA)  
+  return(paste0("g_", genus))
+}, tax_gn$genus)
+
+keep_gn <- !is.na(tax_gn$valencia_name)
+otu_gn_sub <- otu_gn[, keep_gn, drop = FALSE]
+colnames(otu_gn_sub) <- tax_gn$valencia_name[keep_gn]
+
+# 
+otu_gn_agg <- as.data.frame(t(rowsum(t(otu_gn_sub), group = colnames(otu_gn_sub))))
+
+cat("Genus-level taxa:\n")
+print(colnames(otu_gn_agg))
+
+
+otu_sp_agg <- otu_sp_agg[order(rownames(otu_sp_agg)), ]
+otu_gn_agg <- otu_gn_agg[order(rownames(otu_gn_agg)), ]
+
+otu_combined <- cbind(otu_sp_agg, otu_gn_agg)
+
+cat("\nFinal dimensions:", nrow(otu_combined), "samples x", ncol(otu_combined), "taxa\n")
+
+key_taxa <- c("Lactobacillus_crispatus", "Lactobacillus_iners",
+              "Gardnerella_vaginalis", "Sneathia_amnii",
+              "Atopobium_vaginae", "g_Prevotella")
+
+cat("\nKey taxa found:\n")
+print(intersect(key_taxa, colnames(otu_combined)))
+cat("\nKey taxa missing:\n")
+print(setdiff(key_taxa, colnames(otu_combined)))
+
+otu_export <- tibble::rownames_to_column(otu_combined, var = "sampleID")
+otu_export <- dplyr::mutate(otu_export, 
+                             read_count = rowSums(otu_combined), 
+                             .after = "sampleID")
+
+write.csv(otu_export, "VALENCIA/valencia_input_16s.csv", row.names = FALSE, quote = FALSE)
+```
+
+```{r}
+library(phyloseq)
+library(tidyverse)
+library(ggplot2)
+
+valencia_out <- read.csv("VALENCIA/valencia_output_16s.csv")  # adjust filename if different
+
+metadata <- as.data.frame(sample_data(filtered_16s)) %>%
+  tibble::rownames_to_column("sampleID")
+
+df <- valencia_out %>%
+  left_join(metadata, by = "sampleID") %>%
+  mutate(
+    pct_status = case_when(
+      grepl("^\\+", pct) ~ "PCT+",
+      grepl("^-",   pct) ~ "PCT-",
+      TRUE ~ NA_character_
+    ),
+    subCST = factor(subCST, levels = c(
+      "I-A", "I-B",
+      "II",
+      "III-A", "III-B",
+      "IV-A", "IV-B",
+      "IV-C0", "IV-C1", "IV-C2", "IV-C3", "IV-C4",
+      "V"
+    ))
+  ) %>%
+  filter(!is.na(pct_status))
+
+cst_colors <- c(
+  "I-A"    = "#2166ac",
+  "I-B"    = "#6baed6",
+  "II"     = "#74c476",
+  "III-A"  = "#fd8d3c",
+  "III-B"  = "#fdbe85",
+  "IV-A"   = "#d94801",
+  "IV-B"   = "#a50f15",
+  "IV-C0"  = "#7a0177",
+  "IV-C1"  = "#ae017e",
+  "IV-C2"  = "#dd3497",
+  "IV-C3"  = "#f768a1",
+  "IV-C4"  = "#fbb4b9",
+  "V"      = "#238b45"
+)
+
+p1 <- df %>%
+  count(pct_status, subCST) %>%
+  group_by(pct_status) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = pct_status, y = prop, fill = subCST)) +
+  geom_bar(stat = "identity", width = 0.6, color = "white", linewidth = 0.3) +
+  geom_text(aes(label = n), 
+            position = position_stack(vjust = 0.5),
+            size = 3, color = "white", fontface = "bold") +
+  scale_fill_manual(values = cst_colors, drop = FALSE) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Vaginal CST Distribution by PCT Status",
+    x = NULL,
+    y = "Proportion of samples",
+    fill = "Sub-CST"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    legend.position = "right",
+    axis.text.x = element_text(size = 13, face = "bold")
+  )
+
+p2 <- df %>%
+  ggplot(aes(x = pct_status, y = score, color = subCST)) +
+  geom_jitter(width = 0.15, size = 3, alpha = 0.8) +
+  scale_color_manual(values = cst_colors) +
+  labs(
+    title = "VALENCIA Similarity Scores by PCT Status",
+    x = NULL,
+    y = "Cosine similarity to centroid",
+    color = "Sub-CST"
+  ) +
+  theme_classic(base_size = 13)
+
+summary_tbl <- df %>%
+  count(pct_status, subCST) %>%
+  group_by(pct_status) %>%
+  mutate(
+    total = sum(n),
+    pct   = round(100 * n / total, 1)
+  ) %>%
+  arrange(pct_status, subCST)
+
+print(summary_tbl)
+
+df <- df %>%
+  mutate(cst_broad = case_when(
+    grepl("^I",   subCST) & !grepl("^IV", subCST) ~ "L. crispatus\n(CST I)",
+    grepl("^II$", subCST)                          ~ "L. gasseri\n(CST II)",
+    grepl("^III", subCST)                          ~ "L. iners\n(CST III)",
+    grepl("^IV",  subCST)                          ~ "Low Lactobacillus\n(CST IV)",
+    grepl("^V",   subCST)                          ~ "L. jensenii\n(CST V)"
+  ))
+
+p3 <- df %>%
+  count(pct_status, cst_broad) %>%
+  group_by(pct_status) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = pct_status, y = prop, fill = cst_broad)) +
+  geom_bar(stat = "identity", width = 0.6, color = "white") +
+  geom_text(aes(label = paste0(n, "\n(", round(prop*100), "%)")),
+            position = position_stack(vjust = 0.5),
+            size = 3, color = "white", fontface = "bold") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_brewer(palette = "Set1") +
+  labs(
+    title = "Broad CST Architecture by PCT Status",
+    x = NULL, y = "Proportion", fill = "CST Group"
+  ) +
+  theme_classic(base_size = 13)
+
+print(p1)
+print(p2)
+print(p3)
+```
+
+```{r}
+library(phyloseq)
+library(vegan)
+library(microViz)
+library(tidyverse)
+library(ggrepel)
+
+cst_meta <- valencia_out %>% 
+  select(sampleID, subCST, CST, score)
+
+sample_data(filtered_16s)$subCST <- cst_meta$subCST[match(
+  sample_names(filtered_16s), cst_meta$sampleID)]
+sample_data(filtered_16s)$CST <- cst_meta$CST[match(
+  sample_names(filtered_16s), cst_meta$sampleID)]
+sample_data(filtered_16s)$valencia_score <- cst_meta$score[match(
+  sample_names(filtered_16s), cst_meta$sampleID)]
+
+ps_ord <- filtered_16s %>%
+  tax_fix(unknowns = c("Clostridiales_bacterium")) %>%
+  tax_transform("identity", rank = "species") %>%
+  tax_transform("clr", chain = TRUE)
+
+ord_ait <- ordinate(ps_ord, method = "PCoA", distance = "euclidean")
+
+plot_data <- data.frame(
+  MDS1     = ord_ait$vectors[, 1],
+  MDS2     = ord_ait$vectors[, 2],
+  sampleID = sample_names(ps_ord)
+) %>%
+  left_join(
+    data.frame(sample_data(filtered_16s)) %>% 
+      tibble::rownames_to_column("sampleID"),
+    by = "sampleID"
+  )
+
+cst_labels <- c(
+  "I-A"   = "CST I-A: L. crispatus",
+  "I-B"   = "CST I-B: L. crispatus",
+  "II"    = "CST II: L. gasseri",
+  "III-A" = "CST III-A: L. iners",
+  "III-B" = "CST III-B: L. iners )",
+  "IV-A"  = "CST IV-A: BVAB1 + G. vaginalis",
+  "IV-B"  = "CST IV-B: G. vaginalis + A. vaginae",
+  "IV-C0" = "CST IV-C0: Prevotella spp.",
+  "IV-C1" = "CST IV-C1: Streptococcus spp.",
+  "IV-C2" = "CST IV-C2: Enterococcus spp.",
+  "IV-C3" = "CST IV-C3: Bifidobacterium spp.",
+  "IV-C4" = "CST IV-C4: Staphylococcus spp.",
+  "V"     = "CST V: L. jensenii"
+)
+
+pct_centroids <- plot_data %>%
+  group_by(pct) %>%
+  summarise(MDS1 = mean(MDS1, na.rm = TRUE),
+            MDS2 = mean(MDS2, na.rm = TRUE),
+            .groups = "drop")
+
+cst_centroids <- plot_data %>%
+  filter(!is.na(subCST)) %>%
+  group_by(subCST) %>%
+  summarise(MDS1 = mean(MDS1, na.rm = TRUE),
+            MDS2 = mean(MDS2, na.rm = TRUE),
+            n    = n(),
+            .groups = "drop") %>%
+  mutate(label = paste0(cst_labels[subCST]))
+
+var_exp    <- ord_ait$values$Relative_eig * 100
+axis1_label <- paste0("PCoA 1 (", round(var_exp[1], 1), "%)")
+axis2_label <- paste0("PCoA 2 (", round(var_exp[2], 1), "%)")
+
+cst_colors <- c(
+  "I-A"   = "#2166ac", "I-B"   = "#6baed6",
+  "II"    = "#74c476",
+  "III-A" = "#fd8d3c", "III-B" = "#fdbe85",
+  "IV-A"  = "#d94801", "IV-B"  = "#a50f15",
+  "IV-C0" = "#7a0177", "IV-C1" = "#ae017e",
+  "IV-C2" = "#dd3497", "IV-C3" = "#f768a1",
+  "IV-C4" = "#fbb4b9", "V"     = "#238b45"
+)
+
+cst_colors_labeled <- setNames(
+  cst_colors[names(cst_labels)],
+  cst_labels
+)
+
+p_valencia_ord <- ggplot() +
+  geom_point(data = pct_centroids,
+             aes(x = MDS1, y = MDS2, fill = pct),
+             size = 6, shape = 21) +
+  geom_point(data = cst_centroids,
+             aes(x = MDS1, y = MDS2),
+             size = 4, shape = 17, alpha = 0.9, color = "blue") +
+  geom_text_repel(data = cst_centroids,
+                  aes(x = MDS1, y = MDS2, label = label),
+                  color = "blue", size = 2.8,
+                  box.padding = 0.4, max.overlaps = 20) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  scale_color_manual(values = cst_colors_labeled, name = "VALENCIA subCST") +
+  scale_fill_manual(values = c(
+    "-PCT_1" = "#1b9e77",
+    "+PCT_1" = "#d95f02",
+    "+PCT_2" = "#7570b3",
+    "No PCT" = "grey"),
+    name = "PCT status") +
+  labs(
+    title = "16S",
+    x = axis1_label,
+    y = axis2_label
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        legend.box = "vertical")
+
+
+print(p_valencia_ord)
+```
+
+```{r}
+library(phyloseq)
+library(tidyverse)
+library(ggplot2)
+
+valencia_out <- read.csv("VALENCIA/valencia_output_cpn60.csv")  
+
+metadata <- as.data.frame(sample_data(filtered_cpn60)) %>%
+  tibble::rownames_to_column("sampleID")
+
+df <- valencia_out %>%
+  left_join(metadata, by = "sampleID") %>%
+  mutate(
+    pct_status = case_when(
+      grepl("^\\+", pct) ~ "PCT+",
+      grepl("^-",   pct) ~ "PCT-",
+      TRUE ~ NA_character_
+    ),
+    subCST = factor(subCST, levels = c(
+      "I-A", "I-B",
+      "II",
+      "III-A", "III-B",
+      "IV-A", "IV-B",
+      "IV-C0", "IV-C1", "IV-C2", "IV-C3", "IV-C4",
+      "V"
+    ))
+  ) %>%
+  filter(!is.na(pct_status))
+
+cst_colors <- c(
+  "I-A"    = "#2166ac",
+  "I-B"    = "#6baed6",
+  "II"     = "#74c476",
+  "III-A"  = "#fd8d3c",
+  "III-B"  = "#fdbe85",
+  "IV-A"   = "#d94801",
+  "IV-B"   = "#a50f15",
+  "IV-C0"  = "#7a0177",
+  "IV-C1"  = "#ae017e",
+  "IV-C2"  = "#dd3497",
+  "IV-C3"  = "#f768a1",
+  "IV-C4"  = "#fbb4b9",
+  "V"      = "#238b45"
+)
+
+p1 <- df %>%
+  count(pct_status, subCST) %>%
+  group_by(pct_status) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = pct_status, y = prop, fill = subCST)) +
+  geom_bar(stat = "identity", width = 0.6, color = "white", linewidth = 0.3) +
+  geom_text(aes(label = n), 
+            position = position_stack(vjust = 0.5),
+            size = 3, color = "white", fontface = "bold") +
+  scale_fill_manual(values = cst_colors, drop = FALSE) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Vaginal CST Distribution by PCT Status",
+    x = NULL,
+    y = "Proportion of samples",
+    fill = "Sub-CST"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    legend.position = "right",
+    axis.text.x = element_text(size = 13, face = "bold")
+  )
+
+p2 <- df %>%
+  ggplot(aes(x = pct_status, y = score, color = subCST)) +
+  geom_jitter(width = 0.15, size = 3, alpha = 0.8) +
+  scale_color_manual(values = cst_colors) +
+  labs(
+    title = "VALENCIA Similarity Scores by PCT Status",
+    x = NULL,
+    y = "Cosine similarity to centroid",
+    color = "Sub-CST"
+  ) +
+  theme_classic(base_size = 13)
+
+summary_tbl <- df %>%
+  count(pct_status, subCST) %>%
+  group_by(pct_status) %>%
+  mutate(
+    total = sum(n),
+    pct   = round(100 * n / total, 1)
+  ) %>%
+  arrange(pct_status, subCST)
+
+print(summary_tbl)
+
+df <- df %>%
+  mutate(cst_broad = case_when(
+    grepl("^I",   subCST) & !grepl("^IV", subCST) ~ "L. crispatus\n(CST I)",
+    grepl("^II$", subCST)                          ~ "L. gasseri\n(CST II)",
+    grepl("^III", subCST)                          ~ "L. iners\n(CST III)",
+    grepl("^IV",  subCST)                          ~ "Low Lactobacillus\n(CST IV)",
+    grepl("^V",   subCST)                          ~ "L. jensenii\n(CST V)"
+  ))
+
+p3 <- df %>%
+  count(pct_status, cst_broad) %>%
+  group_by(pct_status) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = pct_status, y = prop, fill = cst_broad)) +
+  geom_bar(stat = "identity", width = 0.6, color = "white") +
+  geom_text(aes(label = paste0(n, "\n(", round(prop*100), "%)")),
+            position = position_stack(vjust = 0.5),
+            size = 3, color = "white", fontface = "bold") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_brewer(palette = "Set1") +
+  labs(
+    title = "Broad CST Architecture by PCT Status",
+    x = NULL, y = "Proportion", fill = "CST Group"
+  ) +
+  theme_classic(base_size = 13)
+
+print(p1)
+print(p2)
+print(p3)
+```
+
+```{r}
+library(phyloseq)
+library(vegan)
+library(microViz)
+library(tidyverse)
+library(ggrepel)
+
+cst_meta <- valencia_out %>% 
+  select(sampleID, subCST, CST, score)
+
+sample_data(filtered_cpn60)$subCST <- cst_meta$subCST[match(
+  sample_names(filtered_cpn60), cst_meta$sampleID)]
+sample_data(filtered_cpn60)$CST <- cst_meta$CST[match(
+  sample_names(filtered_cpn60), cst_meta$sampleID)]
+sample_data(filtered_cpn60)$valencia_score <- cst_meta$score[match(
+  sample_names(filtered_cpn60), cst_meta$sampleID)]
+
+ps_ord <- filtered_cpn60 %>%
+  tax_fix(unknowns = c("Clostridiales_bacterium")) %>%
+  tax_transform("identity", rank = "species") %>%
+  tax_transform("clr", chain = TRUE)
+
+ord_ait <- ordinate(ps_ord, method = "PCoA", distance = "euclidean")
+
+plot_data <- data.frame(
+  MDS1     = ord_ait$vectors[, 1],
+  MDS2     = ord_ait$vectors[, 2],
+  sampleID = sample_names(ps_ord)
+) %>%
+  left_join(
+    data.frame(sample_data(filtered_cpn60)) %>% 
+      tibble::rownames_to_column("sampleID"),
+    by = "sampleID"
+  )
+
+cst_labels <- c(
+  "I-A"   = "CST I-A: L. crispatus",
+  "I-B"   = "CST I-B: L. crispatus",
+  "II"    = "CST II: L. gasseri",
+  "III-A" = "CST III-A: L. iners",
+  "III-B" = "CST III-B: L. iners )",
+  "IV-A"  = "CST IV-A: BVAB1 + G. vaginalis",
+  "IV-B"  = "CST IV-B: G. vaginalis + A. vaginae",
+  "IV-C0" = "CST IV-C0: Prevotella spp.",
+  "IV-C1" = "CST IV-C1: Streptococcus spp.",
+  "IV-C2" = "CST IV-C2: Enterococcus spp.",
+  "IV-C3" = "CST IV-C3: Bifidobacterium spp.",
+  "IV-C4" = "CST IV-C4: Staphylococcus spp.",
+  "V"     = "CST V: L. jensenii"
+)
+
+pct_centroids <- plot_data %>%
+  group_by(pct) %>%
+  summarise(MDS1 = mean(MDS1, na.rm = TRUE),
+            MDS2 = mean(MDS2, na.rm = TRUE),
+            .groups = "drop")
+
+cst_centroids <- plot_data %>%
+  filter(!is.na(subCST)) %>%
+  group_by(subCST) %>%
+  summarise(MDS1 = mean(MDS1, na.rm = TRUE),
+            MDS2 = mean(MDS2, na.rm = TRUE),
+            n    = n(),
+            .groups = "drop") %>%
+  mutate(label = paste0(cst_labels[subCST]))
+
+var_exp    <- ord_ait$values$Relative_eig * 100
+axis1_label <- paste0("PCoA 1 (", round(var_exp[1], 1), "%)")
+axis2_label <- paste0("PCoA 2 (", round(var_exp[2], 1), "%)")
+
+cst_colors <- c(
+  "I-A"   = "#2166ac", "I-B"   = "#6baed6",
+  "II"    = "#74c476",
+  "III-A" = "#fd8d3c", "III-B" = "#fdbe85",
+  "IV-A"  = "#d94801", "IV-B"  = "#a50f15",
+  "IV-C0" = "#7a0177", "IV-C1" = "#ae017e",
+  "IV-C2" = "#dd3497", "IV-C3" = "#f768a1",
+  "IV-C4" = "#fbb4b9", "V"     = "#238b45"
+)
+
+cst_colors_labeled <- setNames(
+  cst_colors[names(cst_labels)],
+  cst_labels
+)
+
+p_valencia_ord_cpn60 <- ggplot() +
+  geom_point(data = pct_centroids,
+             aes(x = MDS1, y = MDS2, fill = pct),
+             size = 6, shape = 21) +
+  geom_point(data = cst_centroids,
+             aes(x = MDS1, y = MDS2),
+             size = 4, shape = 17, alpha = 0.9, color = "blue") +
+  geom_text_repel(data = cst_centroids,
+                  aes(x = MDS1, y = MDS2, label = label),
+                  color = "blue", size = 2.8,
+                  box.padding = 0.4, max.overlaps = 20) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  scale_color_manual(values = cst_colors_labeled, name = "VALENCIA subCST") +
+  scale_fill_manual(values = c(
+    "-PCT_1" = "#1b9e77",
+    "+PCT_1" = "#d95f02",
+    "+PCT_2" = "#7570b3",
+    "No PCT" = "grey"),
+    name = "PCT status") +
+  labs(
+    title = "cpn60",
+    x = axis1_label,
+    y = axis2_label
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        legend.box = "vertical")
+
+
+print(p_valencia_ord_cpn60)
+```

@@ -1,0 +1,286 @@
+```{r}
+library(phyloseq)
+library(microbiome)
+library(microViz)
+library(ggplot2)
+library(ggpubr)
+library(emmeans)
+library(patchwork)
+library(dplyr)
+library(tidyr)
+library(lme4)
+
+
+phylo_16s <- readRDS("16S/unfiltered_silva.rds")
+phylo_16s <- prune_samples(sample_data(phylo_16s)$control == "sample", phylo_16s)
+phylo_cpn60 <- readRDS("cpn60/unfiltered.rds")
+phylo_cpn60 <- prune_samples(sample_data(phylo_cpn60)$control == "sample", phylo_cpn60)
+```
+
+```{r}
+get_pw <- function(metric, alpha_wide, correct = T, subject_id) {
+  if(correct == T){
+    f <- as.formula(paste0(metric, " ~ pct + age + bmi_english"))
+  } else{
+    f <- as.formula(paste0(metric, " ~ pct"))
+  }
+  
+  fit <- lmer(as.formula(paste0(metric, " ~ pct + age + bmi_english + (1|subject_id)")), 
+            data = alpha_wide)
+  emm <- emmeans(fit, ~ pct)
+  pw <- pairs(emm, adjust = "none") %>% as.data.frame()
+  pw <- pw %>% 
+    tidyr::separate(contrast, into = c("group1", "group2"), sep = " - ", remove = FALSE) %>%
+    mutate(group1 = gsub("[()]", "", group1),
+            group2 = gsub("[()]", "", group2),
+            metric = metric)
+  return(pw %>% select(metric, contrast, group1, group2, estimate, SE, df, t.ratio, p.value))
+}
+```
+
+```{r}
+plot_alpha_16s <- function(phylo_obj,correct = T){
+  p <- plot_richness(phylo_obj, measures = c("Shannon"), x = "pct")
+  alpha_wide <- p$data %>%
+                  pivot_wider(names_from = variable, values_from = value) %>% 
+                  mutate(subject_id = gsub("-[0-9]+$", "", ID)) %>%
+                  select(pct, age, bmi_english, Shannon, subject_id)
+  alpha_long <- alpha_wide %>%
+                  pivot_longer(cols = c("Shannon"),
+                              names_to = "metric", values_to = "value") %>%
+                  mutate(pct = as.factor(pct))  
+  results_all <- bind_rows(get_pw(metric = "Shannon",
+                                    alpha_wide = alpha_wide,
+                                    correct = correct, subject_id = "subject_id"))
+
+  alpha_long$metric <- factor(alpha_long$metric, levels = c("Shannon"))
+  results_all$metric <- factor(results_all$metric, levels = c("Shannon"))
+
+  stat_annotations <- results_all %>%
+                        group_by(metric) %>%
+                        mutate(
+                          ymax = max(alpha_long$value[alpha_long$metric == unique(metric)], na.rm = TRUE),
+                          ymin = min(alpha_long$value[alpha_long$metric == unique(metric)], na.rm = TRUE),
+                          step = (ymax - ymin) * 0.08,
+                          y.position = ymax + (row_number() - 1) * step) %>%
+                        ungroup() %>%
+                        select(metric, group1, group2, p.value, y.position)
+  stat_annotations <- stat_annotations %>%
+                        mutate(p.signif = case_when(p.value < 0.001 ~ "***",
+                                                    p.value < 0.01  ~ "**",
+                                                    p.value < 0.05  ~ "*",
+                                                    TRUE            ~ "ns"))
+
+  alpha_long$pct <- factor(alpha_long$pct, levels = c("-PCT_1", "+PCT_1", "+PCT_2", "No PCT"), 
+                              labels = c("-PCT_1 (N=34)", "+PCT_1 (N=15)", "+PCT_2 (N=16)","No PCT (N=3)"))
+  stat_annotations$group1 <- factor(stat_annotations$group1, 
+                                   c("-PCT_1", "+PCT_1", "+PCT_2",  "No PCT"), 
+                              labels = c("-PCT_1 (N=34)", "+PCT_1 (N=15)", "+PCT_2 (N=16)", "No PCT (N=3)"))
+  stat_annotations$group2 <- factor(stat_annotations$group2, 
+                                   c("-PCT_1", "+PCT_1", "+PCT_2",  "No PCT"), 
+                              labels = c("-PCT_1 (N=34)", "+PCT_1 (N=15)", "+PCT_2 (N=16)", "No PCT (N=3)"))
+  
+  #alpha_long$pct <- factor(alpha_long$pct,
+  #                  levels = rev(c(
+  #                    "-PCT_1 (N=34)", "+PCT_1 (N=15)", "+PCT_2 (N=16)", "Reproductive (N=70)", 
+  #                    "Benign (N=4)", "Atypical complex hyperplasia (N=21)", 
+  #                    "Endometrioid cancers (N=14)", "Serous cancers (N=11)", "No PCT (N=3)")))
+                  
+  
+  a <- ggplot(alpha_long, aes(x = pct, y = value, fill = pct)) +
+        geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+        geom_jitter(width = 0.15, size = 1.5, alpha = 0.6) +
+        #ggpubr::stat_pvalue_manual(
+        #  stat_annotations,
+        #  label = "p.signif",  
+        #  hide.ns = TRUE,
+        #  tip.length = 0.02) +
+         #   coord_flip() +
+        scale_fill_manual(values = c(
+            "-PCT_1 (N=34)"  = "#1b9e77", 
+            "+PCT_1 (N=15)" = "#d95f02", 
+            "+PCT_2 (N=16)" = "#7570b3"
+          )) +
+        theme_bw(base_size = 13) +  ylab("Shannon index") + 
+        theme(strip.text = element_text(face = "bold"), legend.position = "none",
+              axis.text.x = element_text(angle = 45, hjust = 1, size =13))+ xlab("")
+              #axis.text.y = element_text(angle = 0, size =14)) + xlab("")
+  res <- list(df = alpha_long, plot =a)
+  return(res)
+  #return(a)
+}
+```
+
+```{r}
+plot_alpha_cpn60 <- function(phylo_obj, correct = T){
+  p <- plot_richness(phylo_obj, measures = c("Shannon"), x = "pct")
+  alpha_wide <- p$data %>%
+                  pivot_wider(names_from = variable, values_from = value) %>% 
+                  mutate(subject_id = gsub("-[0-9]+$", "", ID)) %>%
+                  select(pct, age, bmi_english, Shannon, subject_id)
+  alpha_long <- alpha_wide %>%
+                  pivot_longer(cols = c("Shannon"),
+                              names_to = "metric", values_to = "value") %>%
+                  mutate(pct = as.factor(pct))  
+  results_all <- bind_rows(get_pw(metric = "Shannon", 
+                                  alpha_wide = alpha_wide, correct, subject_id="subject_ID"))
+
+  alpha_long$metric <- factor(alpha_long$metric, levels = c("Shannon"))
+  results_all$metric <- factor(results_all$metric, levels = c("Shannon"))
+
+  stat_annotations <- results_all %>%
+                        group_by(metric) %>%
+                        mutate(
+                          ymax = max(alpha_long$value[alpha_long$metric == unique(metric)], na.rm = TRUE),
+                          ymin = min(alpha_long$value[alpha_long$metric == unique(metric)], na.rm = TRUE),
+                          step = (ymax - ymin) * 0.08,
+                          y.position = ymax + (row_number() - 1) * step) %>%
+                        ungroup() %>%
+                        select(metric, group1, group2, p.value, y.position)
+  stat_annotations <- stat_annotations %>%
+                        mutate(p.signif = case_when(p.value < 0.001 ~ "***",
+                                                    p.value < 0.01  ~ "**",
+                                                    p.value < 0.05  ~ "*",
+                                                    TRUE            ~ "ns"))
+
+  alpha_long$pct <- factor(alpha_long$pct, levels = c("-PCT_1", "+PCT_1", "+PCT_2", "No PCT"), 
+                                  labels = c("-PCT_1 (N=34)", "+PCT_1 (N=16)", "+PCT_2 (N=16)", "No PCT (N=3)"))
+
+  stat_annotations$group1 <- factor(stat_annotations$group1, 
+                                  levels = c("-PCT_1", "+PCT_1", "+PCT_2",  "No PCT"), 
+                                  labels = c("-PCT_1 (N=34)", "+PCT_1 (N=16)", "+PCT_2 (N=16)", "No PCT (N=3)"))
+  stat_annotations$group2 <- factor(stat_annotations$group2, 
+                                   levels = c("-PCT_1", "+PCT_1", "+PCT_2", "No PCT"), 
+                                  labels = c("-PCT_1 (N=34)", "+PCT_1 (N=16)", "+PCT_2 (N=16)", "No PCT (N=3)"))
+  
+  
+  
+  
+  
+  a <- ggplot(alpha_long, aes(x = pct, y = value, fill = pct)) +
+        geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+        geom_jitter(width = 0.15, size = 1.5, alpha = 0.6) +
+        ggpubr::stat_pvalue_manual(
+          stat_annotations,
+          label = "p.signif",  
+          hide.ns = TRUE,
+          tip.length = 0.02) +
+        scale_fill_manual(values = c(
+            "-PCT_1 (N=34)"  = "#1b9e77", 
+            "+PCT_1 (N=16)" = "#d95f02", 
+            "+PCT_2 (N=16)" = "#7570b3",
+            "No PCT (N=3)"  = "grey")) +
+        theme_bw(base_size = 13) + ylab("Shannon index") + 
+        theme(strip.text = element_text(face = "bold"), legend.position = "none",
+              axis.text.x = element_text(angle = 45, hjust = 1)) + xlab("")
+  res <- list(df = alpha_long, plot = a)
+  return(res)
+  #return(a)
+}
+```
+
+```{r}
+library(ggplot2)
+library(ggpubr)
+
+metadata <- read.csv("metadata.csv", header = TRUE, sep = "\t")
+metadata <- metadata %>% dplyr::filter(control == "sample")
+metadata$pct <- factor(metadata$pct, levels = c("-PCT_1", "+PCT_1", "+PCT_2", "No PCT"), 
+                                  labels = c("-PCT_1 (N=30)", "+PCT_1 (N=12)", "+PCT_2 (N=15)","No PCT (N=3)"))
+vaginal_ph <- ggplot(metadata, aes(x = pct, y = mean_pH, fill= pct))+
+        geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+        geom_jitter(width = 0.15, size = 1.5, alpha = 0.6) +
+        scale_fill_manual(values = c(
+           "-PCT_1 (N=30)"  = "#1b9e77", 
+            "+PCT_1 (N=12)" = "#d95f02", 
+           "+PCT_2 (N=15)" = "#7570b3",
+           "No PCT (N=3)"  = "grey")) +
+        #stat_compare_means(method = "wilcox.test", comparisons = list(c("-PCT_1", "+PCT_1"),
+        #                                                            c("-PCT_1", "+PCT_2"),
+        #                                                            c("+PCT_1", "+PCT_2"),
+        #                                                            c("-PCT_1", "No PCT"),
+        #                                                            c("+PCT_1", "No PCT"),
+        #                                                            c("+PCT_2", "No PCT")),  label = "p.signif", hide.ns = T) +
+        theme_bw(base_size = 13) + ylab("vaginal pH") + ggtitle("vaginal pH") + ylim(4.5, 7.5)+
+        theme(strip.text = element_text(face = "bold"), legend.position = "none",
+              axis.text.x = element_text(angle = 45, hjust = 1)) + xlab("")
+```
+
+## just PCT data and reprodutive data
+
+```{r}
+alpha_16s <- plot_alpha_16s(phylo_obj = phylo_16s, correct = T)$plot + ggtitle("16S rRNA") + theme(plot.title = element_text(hjust = 0.5))
+alpha_cpn60 <- plot_alpha_cpn60(phylo_obj = phylo_cpn60, correct=T)$plot + ggtitle("cpn60") + 
+                                                  theme(plot.title = element_text(hjust = 0.5))
+vaginal_ph <- vaginal_ph + theme(plot.title = element_text(hjust = 0.5))
+
+pdf("alpha_diversity_cleaned_corrected_1.pdf", width = 14, height = 6)
+
+(alpha_16s | alpha_cpn60 | vaginal_ph) 
+
+#+ plot_annotation(caption = "Raw, unfiltered data used. Significance assessed using a linear model - corrected for age and BMI")
+dev.off()
+```
+
+```{r}
+phylo_obj <- phylo_16s
+p <- plot_richness(phylo_obj, measures = c("Shannon"), x = "pct")
+alpha_wide <- p$data %>%
+                  pivot_wider(names_from = variable, values_from = value) %>% 
+                  select(pct, age, bmi_english, Shannon, ID)
+
+alpha_wide_subset <- alpha_wide %>% dplyr::filter(pct %in% c("+PCT_1", "+PCT_2"))
+alpha_wide_subset$ID <- gsub("-.*", "", alpha_wide_subset$ID)
+
+paired_alpha <- alpha_wide_subset %>%
+  filter(pct %in% c("+PCT_1", "+PCT_2")) %>%
+  group_by(ID) %>%
+  filter(all(c("+PCT_1", "+PCT_2") %in% pct)) %>%
+  ungroup()
+
+paired_alpha$pct <- factor(paired_alpha$pct, levels = c("+PCT_1", "+PCT_2"), 
+                                            labels=c("+PCT_1 (N=15)", "+PCT_2 (N=15)"))
+
+a <- ggplot(paired_alpha, aes(x = pct, y = Shannon)) +
+  geom_boxplot(width = 0.4, fill = "lightgrey", outlier.shape = NA) +
+  geom_line(aes(group = ID, color = ID), size = 0.7, alpha = 0.8) +
+  geom_point(size = 2, aes(color = ID)) +
+  theme_minimal(base_size = 14) +
+  labs(x = "", y = "Shannon diversity") +
+  theme(legend.position = "none") + ggtitle("16S rRNA") + theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r}
+phylo_obj <- phylo_cpn60
+p <- plot_richness(phylo_obj, measures = c("Shannon"), x = "pct")
+alpha_wide <- p$data %>%
+                  pivot_wider(names_from = variable, values_from = value) %>% 
+                  select(pct, age, bmi_english, Shannon, ID)
+
+alpha_wide_subset <- alpha_wide %>% dplyr::filter(pct %in% c("+PCT_1", "+PCT_2"))
+alpha_wide_subset$ID <- gsub("-.*", "", alpha_wide_subset$ID)
+
+paired_alpha <- alpha_wide_subset %>%
+  filter(pct %in% c("+PCT_1", "+PCT_2")) %>%
+  group_by(ID) %>%
+  filter(all(c("+PCT_1", "+PCT_2") %in% pct)) %>%
+  ungroup()
+
+paired_alpha$pct <- factor(paired_alpha$pct, levels = c("+PCT_1", "+PCT_2"), 
+                                            labels=c("+PCT_1 (N=15)", "+PCT_2 (N=15)"))
+
+b <- ggplot(paired_alpha, aes(x = pct, y = Shannon)) +
+  geom_boxplot(width = 0.4, fill = "lightgrey", outlier.shape = NA) +
+  geom_line(aes(group = ID, color = ID), size = 0.7, alpha = 0.8) +
+  geom_point(size = 2, aes(color = ID)) +
+  theme_minimal(base_size = 14) +
+  labs(x = "", y = "Shannon diversity") +
+  theme(legend.position = "none") + ggtitle("cpn60") + theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r}
+library(patchwork)
+pdf("alpha_diversity_paired.pdf", width = 10, height = 5)
+(a | b)
+dev.off()
+```

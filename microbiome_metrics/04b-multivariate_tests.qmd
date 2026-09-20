@@ -1,0 +1,169 @@
+```{r}
+phylo_16s <- readRDS("16S/filtered_silva.rds")
+filtered_16s <- prune_samples(sample_data(phylo_16s)$control == "sample", phylo_16s)
+filtered_16s <- prune_taxa(taxa_sums(filtered_16s) > 0, filtered_16s)
+filtered_16s <- prune_samples(sample_data(filtered_16s)$pct %in% c("-PCT_1", "+PCT_1"), filtered_16s)
+
+
+phylo_cpn60 <- readRDS("cpn60/filtered.rds")
+filtered_cpn60 <- prune_samples(sample_data(phylo_cpn60)$control == "sample", phylo_cpn60)
+filtered_cpn60 <- prune_taxa(taxa_sums(filtered_cpn60) > 0, filtered_cpn60)
+filtered_cpn60 <- prune_samples(sample_data(filtered_cpn60)$pct %in% c("-PCT_1", "+PCT_1"), filtered_cpn60)
+
+```
+
+```{r}
+library(vegan)
+library(dplyr)
+
+generate_permanova_grid <- function(ps_obj,
+                                    formula_vars, # character vector of variables in model
+                                    ranks = c("species", "genus"),
+                                    dists = c("euclidean", "bray", "jaccard", "jsd", "unifrac", "wunifrac")) {
+  
+  all_results <- list()
+  
+  for (rank in ranks) {
+    for (dist in dists) {
+      message("Processing PERMANOVA for Rank: ", rank, " | Distance: ", dist)
+      
+      # Transform appropriately for each distance
+      if (dist %in% c("bray", "jaccard", "jsd")) {
+        ps_rank <- ps_obj %>%
+          tax_fix(unknowns = c("Clostridiales_bacterium")) %>%
+          tax_transform("identity", rank = rank)
+      } else if (dist == "euclidean") {
+        ps_rank <- ps_obj %>%
+          tax_fix(unknowns = c("Clostridiales_bacterium")) %>%
+          tax_transform("identity", rank = rank)
+      } else if (dist %in% c("unifrac", "wunifrac")) {
+        ps_rank <- ps_obj %>%
+          tax_fix(unknowns = c("Clostridiales_bacterium")) %>%
+          tax_transform("identity", rank = "unique")
+      }
+      
+      # Distance matrix
+      dist_mat <- phyloseq::distance(ps_rank, method = dist)
+      
+      # Metadata
+      meta <- as(sample_data(ps_rank), "data.frame")
+      
+      # Formula for PERMANOVA
+      form <- as.formula(paste("dist_mat ~ ", paste(formula_vars, collapse = " + ")))
+      
+      # Run PERMANOVA (marginal effects)
+      adonis_res <- adonis2(form, data = meta, by = "margin")
+      
+      # Store results in tidy format
+      res_df <- as.data.frame(adonis_res) %>%
+        tibble::rownames_to_column("Variable") %>%
+        filter(Variable %in% formula_vars) %>% # keep only model vars
+        mutate(Rank = rank,
+               Distance = dist)
+      
+      all_results[[paste(rank, dist, sep = "_")]] <- res_df
+    }
+  }
+  
+  permanova_df <- bind_rows(all_results)
+  return(permanova_df)
+}
+
+
+```
+
+## All variables
+
+```{r}
+use <- c("pct", "age", "bmi_english", "menarche", "postmeno_yrs", "contraceptives", "hrt")
+permanova_results_16S_all <- generate_permanova_grid(filtered_16s, use)
+permanova_results_16S_all_copy <- permanova_results_16S_all
+
+
+permanova_results_cpn60_all <- generate_permanova_grid(filtered_cpn60, use)
+permanova_results_cpn60_all_copy <- permanova_results_cpn60_all
+```
+
+```{r,  fig.height=20, fig.width=20}
+library(scales)
+
+permanova_results_16S_all_copy$Variable <- factor(permanova_results_16S_all_copy$Variable, 
+                                               levels = c("pct", "age", "bmi_english", "menarche", "postmeno_yrs", "contraceptives", "hrt"),
+                                              labels = c("PCT", "Age",  "BMI",
+        "Age at menarche", "Years postmenopause", "Previous use of contraceptives (n=48 (98%))", "Previous use of HRT (n=8 (16.3))"))
+
+permanova_results_16S_all_copy$type <- "16S rRNA"
+permanova_results_16S_all_copy <- permanova_results_16S_all_copy %>% filter(Rank %in% c( "genus", "species"))
+
+
+permanova_results_cpn60_all_copy$Variable <- factor(permanova_results_cpn60_all_copy$Variable, 
+                                              levels = c("pct", "age", "bmi_english",  "menarche", "postmeno_yrs", "contraceptives", "hrt"),
+                                              labels = c("PCT", "Age",  "BMI",
+        "Age at menarche", "Years postmenopause", "Previous use of contraceptives (n=49 (98%))", "Previous use of HRT (n=8 (16.3%))"))
+
+permanova_results_cpn60_all_copy$type <- "cpn60"
+permanova_results_cpn60_all_copy <- permanova_results_cpn60_all_copy %>% filter(Rank %in% c( "genus", "species"))
+
+all <- rbind(permanova_results_16S_all_copy, permanova_results_cpn60_all_copy)
+```
+
+```{r, fig.height=10, fig.width=20}
+
+a <- permanova_results_16S_all_copy %>% 
+filter(Rank ==  "species") %>%
+ggplot( aes(x = Distance, y = forcats::fct_rev(Variable), fill = R2)) +
+  geom_tile(color = "grey80") +
+  geom_text(aes(label = paste0(signif(R2, 2))), color = "black", size = 5.5) +
+  # Add black border for significant p-values
+  geom_tile(data = subset(permanova_results_16S_all_copy %>% filter(Rank %in% c("species")), `Pr(>F)` < 0.05),
+            aes(x = Distance, y = forcats::fct_rev(Variable)),
+            color = "black", fill = NA, linewidth = 1) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, limits = c(0, 0.08)) +
+  facet_grid(Rank ~ type) +
+  theme_minimal(base_size = 19) +
+  theme(
+    axis.text.x = element_text(size = 19, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 19),
+    axis.title.x = element_text(size = 19, face = "bold"),
+    axis.title.y = element_text(size = 19, face = "bold"),
+    legend.title = element_text(size = 19, face = "bold"),
+    legend.text = element_text(size = 17),
+    strip.text = element_text(size = 19, face = "bold")  # bigger facet titles
+  )  + ylab("") + xlab("") 
+#dev.off()
+
+```
+
+```{r, fig.height=10, fig.width=20}
+
+b <- permanova_results_cpn60_all_copy %>% 
+filter(Rank ==  "species") %>%
+ggplot( aes(x = Distance, y = forcats::fct_rev(Variable), fill = R2)) +
+  geom_tile(color = "grey80") +
+  geom_text(aes(label = paste0(signif(R2, 2))), color = "black", size = 5.5) +
+  # Add black border for significant p-values
+  geom_tile(data = subset(permanova_results_cpn60_all_copy %>% filter(Rank %in% c("species")), `Pr(>F)` < 0.05),
+            aes(x = Distance, y = forcats::fct_rev(Variable)),
+            color = "black", fill = NA, linewidth = 1) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, limits = c(0, 0.08)) +
+  facet_grid(Rank ~ type) +
+  theme_minimal(base_size = 19) +
+  theme(
+    axis.text.x = element_text(size = 19, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 19),
+    axis.title.x = element_text(size = 19, face = "bold"),
+    axis.title.y = element_text(size = 19, face = "bold"),
+    legend.title = element_text(size = 19, face = "bold"),
+    legend.text = element_text(size = 17),
+    strip.text = element_text(size = 19, face = "bold")  # bigger facet titles
+  )  + ylab("") + xlab("") 
+#dev.off()
+
+```
+
+```{r}
+library(patchwork)
+
+(a | b) + plot_layout(guides = "collect") + 
+    plot_annotation(tag_levels = "A")
+```

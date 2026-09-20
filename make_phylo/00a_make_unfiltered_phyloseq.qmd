@@ -1,0 +1,33 @@
+This script makes the initial phyloseq object (no filtering or decontamination) - these saved objects will be used in the future
+
+# 16S - make phyloseq for restore
+
+```{r}
+otus_16s <- t(read.csv("16S/qiime/wt_controls/asv_table.tsv", header = T, sep = "\t", row.names = 1, skip = 1))
+otus_16s <- generate_otu_table(otus_16s)
+tax_16s <- read.csv("16S/qiime/wt_controls/taxonomy_V4.tsv", header = T, sep = "\t")
+tax_16s <- generate_tax_table(tax_s = tax_16s, filtered = FALSE)
+metadata <- read.csv("metadata.csv", header = TRUE, sep = "\t")
+tree_16s <- read_tree(file.path("16S/qiime/wt_controls/asvs.tree"))
+tree_16s <- generate_phy_tree(tree_16s)
+phyloseq_obj_16s <- phyloseq(otu_table(otus_16s, taxa_are_rows=FALSE), tax_table(as.matrix(tax_16s)), 
+                       sample_data(metadata), tree_16s)
+phyloseq_obj_16s <- prune_samples(sample_sums(phyloseq_obj_16s) > 0, phyloseq_obj_16s)
+saveRDS(phyloseq_obj_16s, paste0("16S/unfiltered_silva.rds"))
+
+```
+
+## cpn60 - make phyloseq
+
+```{r}
+otus_cpn60 <- t(read.csv("cpn60/updated/wt_controls/asv_table.tsv", header = T, sep = "\t", row.names = 1, skip = 1))
+otus_cpn60 <- generate_otu_table(otus_cpn60)
+tax_cpn60 <- read.csv("cpn60/updated/wt_controls/taxonomy.tsv", header = T, sep = "\t")
+tax_cpn60 <- generate_tax_table(tax_s = tax_cpn60, filtered = FALSE)
+tree_cpn60 <- read_tree(file.path("cpn60/updated/wt_controls/asvs.tree"))
+tree_cpn60 <- generate_phy_tree(tree_cpn60)
+phyloseq_obj_cpn60 <- phyloseq(otu_table(otus_cpn60, taxa_are_rows=FALSE), tax_table(as.matrix(tax_cpn60)), 
+                       sample_data(metadata), tree_cpn60)
+phyloseq_obj_cpn60 <- prune_samples(sample_sums(phyloseq_obj_cpn60) > 0, phyloseq_obj_cpn60)
+saveRDS(phyloseq_obj_cpn60, paste0("cpn60/unfiltered.rds"))
+```

@@ -1,0 +1,507 @@
+```{r}
+phylo_16s <- readRDS("16S/filtered_silva.rds")
+filtered_16s <- prune_samples(sample_data(phylo_16s)$control == "sample", phylo_16s)
+filtered_16s <- prune_taxa(taxa_sums(filtered_16s) > 0, filtered_16s)
+
+phylo_cpn60 <- readRDS("cpn60/filtered.rds")
+filtered_cpn60 <- prune_samples(sample_data(phylo_cpn60)$control == "sample", phylo_cpn60)
+filtered_cpn60 <- prune_taxa(taxa_sums(filtered_cpn60) > 0, filtered_cpn60)
+```
+
+```{r, fig.height=8, fig.width=8}
+library(microViz)
+library(ggplot2)
+library(dplyr)
+
+generate_ord_grid <- function(ps_obj,
+                              ranks = c("genus", "species", "unique"),
+                              dists = c("aitchison", "bray", "jaccard", "gunifrac", "unifrac", "wunifrac"),
+                              color_var = "pct") {
+  
+  all_data <- list()
+  
+  for (rank in ranks) {
+    for (dist in dists) {
+      message("Processing: ", rank, " - ", dist)
+      
+      if (dist %in% c("bray", "jaccard")) {
+        ps_rank <- ps_obj %>%
+          tax_fix(unknowns = c("Clostridiales_bacterium", "Porphyromonadaceae_bacterium", "Veillonellaceae_bacterium")) %>%
+          tax_transform("identity", rank = rank) %>%
+          dist_calc(dist = dist) %>%
+          ord_calc("PCoA") %>%
+          ord_plot(color = color_var)
+        
+      } else if (dist == "aitchison") {
+        ps_rank <- ps_obj %>%
+          tax_fix(unknowns = c("Clostridiales_bacterium", "Porphyromonadaceae_bacterium", "Veillonellaceae_bacterium")) %>%
+          tax_transform("clr", rank = rank) %>%
+          ord_calc("PCA") %>%
+          ord_plot(color = color_var)
+        
+      } else if (dist == "gunifrac") {
+        ps_rank <- ps_obj %>%
+          tax_fix() %>%
+          tax_transform("identity", rank = "unique") %>%
+          dist_calc(dist = dist, gunifrac_alpha = 0.5) %>%
+          ord_calc("PCoA") %>%
+          ord_plot(color = color_var)
+        
+      } else {
+        ps_rank <- ps_obj %>%
+          tax_fix() %>%
+          tax_transform("identity", rank = "unique") %>%
+          dist_calc(dist = dist) %>%
+          ord_calc("PCoA") %>%
+          ord_plot(color = color_var)
+      }
+      
+      # Extract axis labels (PC1 [16%], PC2 [8%], …)
+      axis_labels <- ps_rank$labels
+      
+      # Add them as new columns in coords_df
+      coords_df <- ps_rank$data %>%
+        mutate(rank = rank,
+               distance = dist,
+               axis1_label = axis_labels[2],
+               axis2_label = axis_labels[3])
+      
+      all_data[[paste(rank, dist, sep = "_")]] <- coords_df
+    }
+  }
+  
+  # Combine everything into one big data.frame
+  plot_data <- bind_rows(all_data)
+  
+  return(plot_data)
+}
+
+
+```
+
+```{r}
+plot_data_16S <- generate_ord_grid(ps_obj = filtered_16s)
+plot_data_cpn60 <- generate_ord_grid(ps_obj = filtered_cpn60)
+
+plot_data_16S$rank <- factor(plot_data_16S$rank, levels = c("genus", "species", "unique"))
+plot_data_16S$distance <- factor(plot_data_16S$distance, levels =  c("aitchison", "bray", "jaccard", "gunifrac", "unifrac", "wunifrac"))
+
+plot_data_cpn60$rank <- factor(plot_data_cpn60$rank, levels = c("genus", "species", "unique"))
+plot_data_cpn60$distance <- factor(plot_data_cpn60$distance, levels =  c("aitchison", "bray", "jaccard", "gunifrac", "unifrac", "wunifrac"))
+
+plot_data_16S <- plot_data_16S %>% mutate(MDS1 = case_when(is.na(MDS1)==T ~ PC1,
+                                                           TRUE ~ MDS1),
+                                          MDS2 = case_when(is.na(MDS2)==T ~ PC2,
+                                                           TRUE ~ MDS2))
+plot_data_cpn60 <- plot_data_cpn60 %>% mutate(MDS1 = case_when(is.na(MDS1)==T ~ PC1,
+                                                           TRUE ~ MDS1),
+                                          MDS2 = case_when(is.na(MDS2)==T ~ PC2,
+                                                           TRUE ~ MDS2))
+```
+
+```{r, fig.width=12, fig.height=6, warning=F}
+pdf("beta_diversity_16S.pdf", width = 16, height = 10)
+
+plot_data_16S %>% 
+  filter(!(distance %in% c("gunifrac", "unifrac", "wunifrac") & (rank %in% c("genus", "species")))) %>%
+ggplot(aes(x = MDS1, y = MDS2, color = pct)) +
+    geom_point(size = 2, alpha = 0.5) +
+    facet_grid(rank ~ distance, 
+             scales = "free",   # allows each facet to have its own x/y range
+             labeller = labeller(
+               # Use a function to return custom labels
+               .rows = function(r) plot_data_16S$axis2_label[match(r, plot_data_16S$rank)],
+               .cols = function(c) plot_data_16S$axis1_label[match(c, plot_data_16S$distance)]
+             )) +
+    theme_minimal() +
+    theme(legend.position = "bottom") +
+    scale_color_manual(values = c(
+    "-PCT_1"  = "#1b9e77", 
+    "+PCT_1" = "#d95f02",
+    "+PCT_2" = "#7570b3",
+    "No PCT" = "grey")) + 
+  stat_ellipse(level = 0.90,  # 95% confidence ellipse
+               type = "norm", # options: "norm", "t", "euclid"
+               linetype = "dashed") + 
+    labs(title = "Ordination by Rank and Distance - 16S")
+dev.off()
+
+
+pdf("beta_diversity_cpn60.pdf", width = 16, height = 10)
+plot_data_cpn60 %>% 
+  filter(!(distance %in% c("gunifrac", "unifrac", "wunifrac") & (rank %in% c("genus", "species")))) %>%
+ggplot(aes(x = MDS1, y = MDS2, color = pct)) +
+    geom_point(size = 2, alpha = 0.5) +
+     facet_grid(rank ~ distance, 
+             scales = "free",   # allows each facet to have its own x/y range
+             labeller = labeller(
+               # Use a function to return custom labels
+               .rows = function(r) plot_data_cpn60$axis2_label[match(r, plot_data_cpn60$rank)],
+               .cols = function(c) plot_data_cpn60$axis1_label[match(c, plot_data_cpn60$distance)]
+             )) +
+    theme_minimal() +
+    theme(legend.position = "bottom") +
+    scale_color_manual(values = c(
+    "-PCT_1"  = "#1b9e77", 
+    "+PCT_1" = "#d95f02",
+    "+PCT_2" = "#7570b3",
+    "No PCT" = "grey")) + 
+  stat_ellipse(level = 0.90,  # 95% confidence ellipse
+               type = "norm", # options: "norm", "t", "euclid"
+               linetype = "dashed")+
+    labs(title = "Ordination by Rank and Distance - cpn60") 
+dev.off()
+
+
+
+```
+
+```{r}
+centroids_16S <- plot_data_16S %>%
+  filter(!(distance %in% c("gunifrac", "unifrac", "wunifrac") & (rank %in% c("genus", "species")))) %>%
+  group_by(rank, distance, pct, axis1_label, axis2_label) %>%
+  summarise(MDS1 = mean(MDS1, na.rm = TRUE),
+            MDS2 = mean(MDS2, na.rm = TRUE),
+            .groups = "drop")
+
+
+centroids_cpn60 <- plot_data_cpn60 %>%
+  filter(!(distance %in% c("gunifrac", "unifrac", "wunifrac") & (rank %in% c("genus", "species")))) %>%
+ group_by(rank, distance, pct, axis1_label, axis2_label) %>%
+  summarise(MDS1 = mean(MDS1, na.rm = TRUE),
+            MDS2 = mean(MDS2, na.rm = TRUE),
+            .groups = "drop")
+```
+
+```{r}
+pdf("beta_diversity_16S_centroids.pdf", width = 16, height = 10)
+ggplot(centroids_16S, aes(x = MDS1, y = MDS2, color = pct)) +
+  geom_point(size = 4) +  # centroids
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  facet_grid(rank ~ distance, scales = "free") +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  scale_color_manual(values = c(
+    "-PCT_1"  = "#1b9e77",
+    "+PCT_1"  = "#d95f02",
+    "+PCT_2"  = "#7570b3",
+    "No PCT" = "grey"
+  )) +
+  labs(title = "Ordination by Rank and Distance - 16S")
+dev.off()
+
+pdf("beta_diversity_cpn60_centroids.pdf", width = 16, height = 10)
+ggplot(centroids_cpn60, aes(x = MDS1, y = MDS2, color = pct)) +
+  geom_point(size = 4) +  # centroids
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  facet_grid(rank ~ distance, scales = "free") +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  scale_color_manual(values = c(
+    "-PCT_1"  = "#1b9e77",
+    "+PCT_1"  = "#d95f02",
+    "+PCT_2"  = "#7570b3",
+    "No PCT" = "grey"
+  )) +
+  labs(title = "Ordination by Rank and Distance - cpn60")
+dev.off()
+```
+
+16S - genus
+
+```{r, fig.height=5, fig.width=17}
+ord_with_cst_16S_genus <- plot_data_16S %>%
+  mutate(CST = sample_data(csts_16S_genus$phylo)$CST[match(ID, sample_names(csts_16S_genus$phylo))])
+
+cst_centroids_16S <- ord_with_cst_16S_genus %>%
+  group_by(rank, distance, CST) %>%
+  summarise(MDS1 = mean(MDS1, na.rm = TRUE),
+            MDS2 = mean(MDS2, na.rm = TRUE),
+            .groups = "drop")
+
+cst_centroids_16S <- merge(cst_centroids_16S,csts_16S_genus$top , by.x = "CST", by.y = "cst") 
+
+cst_centroids_16S <- cst_centroids_16S %>%  mutate(label = paste0("CST ", CST, ": ", genus))
+
+centroids_16S_sub <- centroids_16S %>% filter(rank %in% c("species"))  %>%
+                            filter(distance %in% c("aitchison")) %>% na.omit()
+
+cst_centroids_16S_sub <- cst_centroids_16S %>% filter(rank %in%c( "species")) %>%
+                            filter(distance %in% c("aitchison")) %>% na.omit()
+
+plot_data_16S_sub <- plot_data_16S %>% filter(rank %in% c( "species"))  %>%
+                            filter(distance %in% c("aitchison"))
+
+pdf("cst_16S_cst_genus.pdf", width = 8, height = 5)
+ggplot() +
+  geom_point(data = centroids_16S_sub,aes(x = MDS1, y = MDS2, color = pct),size = 5) + 
+  geom_point(data = cst_centroids_16S_sub,aes(x = MDS1, y = MDS2),size = 3,shape = 17, color = "blue",alpha = 0.8) +
+  geom_text(data = cst_centroids_16S_sub,aes(x = MDS1, y = MDS2, label = label),vjust = -0.8, hjust=0.5, color = "blue", size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  facet_grid(distance ~ rank, 
+             scales = "free",   # allows each facet to have its own x/y range
+             labeller = labeller(
+               # Use a function to return custom labels
+               .cols = function(c) centroids_16S_sub$axis2_label[match(c, centroids_16S_sub$rank)],
+               .rows = function(r) centroids_16S_sub$axis1_label[match(r, centroids_16S_sub$distance)]
+             ))+
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  scale_color_manual(values = c(
+    "-PCT_1"  = "#1b9e77",
+    "+PCT_1"  = "#d95f02",
+    "+PCT_2"  = "#7570b3",
+    "No PCT"  = "grey")) +
+  labs(title = "Ordination by species and Aitchison distance using 16S and CST defined by genus (k=4)")
+dev.off()
+
+```
+
+```{r, fig.height=5, fig.width=17}
+ord_with_cst_16S_species <- plot_data_16S %>%
+  mutate(CST = sample_data(csts_16S_species$phylo)$CST[match(ID, sample_names(csts_16S_species$phylo))])
+
+cst_centroids_16S <- ord_with_cst_16S_species %>%
+  group_by(rank, distance, CST) %>%
+  summarise(MDS1 = mean(MDS1, na.rm = TRUE),
+            MDS2 = mean(MDS2, na.rm = TRUE),
+            .groups = "drop")
+
+cst_centroids_16S <- merge(cst_centroids_16S,csts_16S_species$top , by.x = "CST", by.y = "cst") 
+
+cst_centroids_16S <- cst_centroids_16S %>%  mutate(label = paste0("CST ", CST, ": ", species))
+
+centroids_16S_sub <- centroids_16S %>% filter(rank %in% c("species"))  %>%
+                            filter(distance %in% c("aitchison")) %>% na.omit()
+
+cst_centroids_16S_sub <- cst_centroids_16S %>% filter(rank %in%c("species")) %>%
+                            filter(distance %in% c("aitchison")) %>% na.omit()
+
+plot_data_16S_sub <- plot_data_16S %>% filter(rank %in% c("species"))  %>%
+                            filter(distance %in% c("aitchison"))
+
+#pdf("cst_16S_cst_species.pdf", width = 8, height = 5)
+beta_diversity_16s <-  ggplot() +
+  geom_point(data = centroids_16S_sub,aes(x = MDS1, y = MDS2, color = pct),size = 5) + 
+  geom_point(data = cst_centroids_16S_sub,aes(x = MDS1, y = MDS2),size = 3,shape = 17, color = "blue",alpha = 0.8) +
+  geom_text(data = cst_centroids_16S_sub,aes(x = MDS1, y = MDS2, label = label),vjust = -0.8, hjust=0.5, color = "blue", size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  facet_grid(distance ~ rank, 
+             scales = "free",   # allows each facet to have its own x/y range
+             labeller = labeller(
+               # Use a function to return custom labels
+               .cols = function(c) centroids_16S_sub$axis2_label[match(c, centroids_16S_sub$rank)],
+               .rows = function(r) centroids_16S_sub$axis1_label[match(r, centroids_16S_sub$distance)]
+             )) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  scale_color_manual(values = c(
+    "-PCT_1"  = "#1b9e77",
+    "+PCT_1"  = "#d95f02",
+    "+PCT_2"  = "#7570b3",
+    "No PCT"  = "grey")) +
+  labs(title = "")
+#dev.off()
+```
+
+```{r, fig.height=5, fig.width=17}
+ord_with_cst_cpn60_genus <- plot_data_cpn60 %>%
+  mutate(CST = sample_data(csts_cpn60_genus$phylo)$CST[match(ID, sample_names(csts_cpn60_genus$phylo))])
+
+cst_centroids_cpn60 <- ord_with_cst_cpn60_genus %>%
+  group_by(rank, distance, CST) %>%
+  summarise(MDS1 = mean(MDS1, na.rm = TRUE),
+            MDS2 = mean(MDS2, na.rm = TRUE),
+            .groups = "drop")
+
+cst_centroids_cpn60 <- merge(cst_centroids_cpn60,csts_cpn60_genus$top , by.x = "CST", by.y = "cst") 
+
+cst_centroids_cpn60 <- cst_centroids_cpn60 %>%  mutate(label = paste0("CST ", CST, ": ", genus))
+
+centroids_cpn60_sub <- centroids_cpn60 %>% filter(rank %in% c("unique"))  %>%
+                            filter(distance %in% c("wunifrac")) %>% na.omit()
+
+cst_centroids_cpn60_sub <- cst_centroids_cpn60 %>% filter(rank %in%c("unique")) %>%
+                            filter(distance %in% c("wunifrac")) %>% na.omit()
+
+plot_data_cpn60_sub <- plot_data_cpn60 %>% filter(rank %in% c("unique"))  %>%
+                            filter(distance %in% c("wunifrac"))
+
+pdf("cst_cpn60_cst_genus.pdf", width = 8, height = 5)
+ggplot() +
+  geom_point(data = centroids_cpn60_sub,aes(x = MDS1, y = MDS2, color = pct),size = 5) + 
+  geom_point(data = cst_centroids_cpn60_sub,aes(x = MDS1, y = MDS2),size = 3,shape = 17, color = "blue",alpha = 0.8) +
+  geom_text(data = cst_centroids_cpn60_sub,aes(x = MDS1, y = MDS2, label = label),vjust = -0.8, hjust=0.5, color = "blue", size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  facet_grid(distance ~ rank, 
+             scales = "free",   # allows each facet to have its own x/y range
+             labeller = labeller(
+               # Use a function to return custom labels
+               .cols = function(c) centroids_cpn60_sub$axis2_label[match(c, centroids_cpn60_sub$rank)],
+               .rows = function(r) centroids_cpn60_sub$axis1_label[match(r, centroids_cpn60_sub$distance)]
+             )) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  scale_color_manual(values = c(
+    "-PCT_1"  = "#1b9e77",
+    "+PCT_1"  = "#d95f02",
+    "+PCT_2"  = "#7570b3",
+    "No PCT"  = "grey")) +
+  labs(title = "Ordination by species and Aitchison distance using cpn60 and CST defined by genus (k=9)")
+dev.off()
+
+```
+
+```{r}
+ord_with_cst_cpn60_genus <- plot_data_cpn60 %>%
+  mutate(CST = sample_data(csts_cpn60_genus$phylo)$CST[match(ID, sample_names(csts_cpn60_genus$phylo))])
+
+cst_centroids_cpn60 <- ord_with_cst_cpn60_genus %>%
+  group_by(rank, distance, CST) %>%
+  summarise(MDS1 = mean(MDS1, na.rm = TRUE),
+            MDS2 = mean(MDS2, na.rm = TRUE),
+            .groups = "drop")
+
+cst_centroids_cpn60 <- merge(cst_centroids_cpn60,csts_cpn60_genus$top , by.x = "CST", by.y = "cst") 
+
+cst_centroids_cpn60 <- cst_centroids_cpn60 %>%  mutate(label = paste0("CST ", CST, ": ", genus))
+
+centroids_cpn60_sub <- centroids_cpn60 %>% filter(rank %in% c("unique"))  %>%
+                            filter(distance %in% c("wunifrac")) %>% na.omit()
+
+cst_centroids_cpn60_sub <- cst_centroids_cpn60 %>% filter(rank %in%c("unique")) %>%
+                            filter(distance %in% c("wunifrac")) %>% na.omit()
+
+plot_data_cpn60_sub <- plot_data_cpn60 %>% filter(rank %in% c("unique"))  %>%
+                            filter(distance %in% c("wunifrac"))
+
+pdf("cst_cpn60_cst_unique.pdf", width = 8, height = 5)
+ggplot() +
+  geom_point(data = centroids_cpn60_sub,aes(x = MDS1, y = MDS2, color = pct),size = 5) + 
+  geom_point(data = cst_centroids_cpn60_sub,aes(x = MDS1, y = MDS2),size = 3,shape = 17, color = "blue",alpha = 0.8) +
+  geom_text(data = cst_centroids_cpn60_sub,aes(x = MDS1, y = MDS2, label = label),vjust = -0.8, hjust=0.5, color = "blue", size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+   facet_grid(distance ~ rank, 
+             scales = "free",   # allows each facet to have its own x/y range
+             labeller = labeller(
+               # Use a function to return custom labels
+               .cols = function(c) centroids_cpn60_sub$axis2_label[match(c, centroids_cpn60_sub$rank)],
+               .rows = function(r) centroids_cpn60_sub$axis1_label[match(r, centroids_cpn60_sub$distance)]
+             )) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  scale_color_manual(values = c(
+    "-PCT_1"  = "#1b9e77",
+    "+PCT_1"  = "#d95f02",
+    "+PCT_2"  = "#7570b3",
+    "No PCT"  = "grey")) +
+  labs(title = "Ordination by wunifrac distance using cpn60 and CST defined by genus (k=9)")
+dev.off()
+```
+
+```{r, fig.height=5, fig.width=17}
+ord_with_cst_cpn60_species <- plot_data_cpn60 %>%
+  mutate(CST = sample_data(csts_cpn60_species$phylo)$CST[match(ID, sample_names(csts_cpn60_species$phylo))])
+
+cst_centroids_cpn60 <- ord_with_cst_cpn60_species %>%
+  group_by(rank, distance, CST) %>%
+  summarise(MDS1 = mean(MDS1, na.rm = TRUE),
+            MDS2 = mean(MDS2, na.rm = TRUE),
+            .groups = "drop")
+
+cst_centroids_cpn60 <- merge(cst_centroids_cpn60,csts_cpn60_species$top , by.x = "CST", by.y = "cst") 
+
+cst_centroids_cpn60 <- cst_centroids_cpn60 %>%  mutate(label = paste0("CST ", CST, ": ", species))
+
+centroids_cpn60_sub <- centroids_cpn60 %>% filter(rank %in% c("unique"))  %>%
+                            filter(distance %in% c("wunifrac")) %>% na.omit()
+
+cst_centroids_cpn60_sub <- cst_centroids_cpn60 %>% filter(rank %in%c("unique")) %>%
+                            filter(distance %in% c("wunifrac")) %>% na.omit()
+
+plot_data_cpn60_sub <- plot_data_cpn60 %>% filter(rank %in% c("unique"))  %>%
+                            filter(distance %in% c("wunifrac"))
+
+pdf("cst_cpn60_cst_species.pdf", width = 8, height = 5)
+ggplot() +
+  geom_point(data = centroids_cpn60_sub,aes(x = MDS1, y = MDS2, color = pct),size = 5) + 
+  geom_point(data = cst_centroids_cpn60_sub,aes(x = MDS1, y = MDS2),size = 3,shape = 17, color = "blue",alpha = 0.8) +
+  geom_text(data = cst_centroids_cpn60_sub,aes(x = MDS1, y = MDS2, label = label), nudge_x = 0.02, direction = "y", color = "blue", size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+   facet_grid(distance ~ rank, 
+             scales = "free",   # allows each facet to have its own x/y range
+             labeller = labeller(
+               # Use a function to return custom labels
+               .cols = function(c) centroids_cpn60_sub$axis2_label[match(c, centroids_cpn60_sub$rank)],
+               .rows = function(r) centroids_cpn60_sub$axis1_label[match(r, centroids_cpn60_sub$distance)]
+             )) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  scale_color_manual(values = c(
+    "-PCT_1"  = "#1b9e77",
+    "+PCT_1"  = "#d95f02",
+    "+PCT_2"  = "#7570b3",
+    "No PCT"  = "grey")) +
+  labs(title = "Ordination by species and wunifrac distance using cpn60 and CST defined by genus (k=10)")
+dev.off()
+```
+
+```{r}
+ord_with_cst_cpn60_species <- plot_data_cpn60 %>%
+  mutate(CST = sample_data(csts_cpn60_species$phylo)$CST[match(ID, sample_names(csts_cpn60_species$phylo))])
+
+cst_centroids_cpn60 <- ord_with_cst_cpn60_species %>%
+  group_by(rank, distance, CST) %>%
+  summarise(MDS1 = mean(MDS1, na.rm = TRUE),
+            MDS2 = mean(MDS2, na.rm = TRUE),
+            .groups = "drop")
+
+cst_centroids_cpn60 <- merge(cst_centroids_cpn60,csts_cpn60_species$top , by.x = "CST", by.y = "cst") 
+
+cst_centroids_cpn60 <- cst_centroids_cpn60 %>%  mutate(label = paste0("CST ", CST, ": ", species))
+
+centroids_cpn60_sub <- centroids_cpn60 %>% filter(rank %in% c("species"))  %>%
+                            filter(distance %in% c("jaccard")) %>% na.omit()
+
+cst_centroids_cpn60_sub <- cst_centroids_cpn60 %>% filter(rank %in%c("species")) %>%
+                            filter(distance %in% c("jaccard")) %>% na.omit()
+
+plot_data_cpn60_sub <- plot_data_cpn60 %>% filter(rank %in% c("species"))  %>%
+                            filter(distance %in% c("jaccard"))
+
+#pdf("cst_cpn60_cst_species.pdf", width = 8, height = 5)
+c <- ggplot() +
+  geom_point(data = centroids_cpn60_sub,aes(x = MDS1, y = MDS2, color = pct),size = 5) + 
+  geom_point(data = cst_centroids_cpn60_sub,aes(x = MDS1, y = MDS2),size = 3,shape = 17, color = "blue",alpha = 0.8) +
+  geom_text(data = cst_centroids_cpn60_sub,aes(x = MDS1, y = MDS2, label = label), nudge_x = 0.02, direction = "y", color = "blue", size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+   facet_grid(distance ~ rank, 
+             scales = "free",   # allows each facet to have its own x/y range
+             labeller = labeller(
+               # Use a function to return custom labels
+               .cols = function(c) centroids_cpn60_sub$axis2_label[match(c, centroids_cpn60_sub$rank)],
+               .rows = function(r) centroids_cpn60_sub$axis1_label[match(r, centroids_cpn60_sub$distance)]
+             )) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  scale_color_manual(values = c(
+    "-PCT_1"  = "#1b9e77",
+    "+PCT_1"  = "#d95f02",
+    "+PCT_2"  = "#7570b3",
+    "No PCT"  = "grey")) 
+#dev.off()
+```
+
+```{r}
+pdf("figure2.pdf", width = 13, height = 5)
+(beta_diversity_16s | c)
+dev.off()
+```

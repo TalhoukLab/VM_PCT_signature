@@ -1,0 +1,354 @@
+```{r}
+library(phyloseq)
+library(vegan)
+library(pheatmap)
+library(microViz)
+library(ggplotify)
+library(patchwork)
+library(dplyr)
+```
+
+```{r}
+phylo_16s <- readRDS("16S/filtered_silva.rds")
+filtered_16s <- prune_samples(sample_data(phylo_16s)$control == "sample", phylo_16s)
+filtered_16s <- prune_taxa(taxa_sums(filtered_16s) > 0, filtered_16s)
+
+phylo_cpn60 <- readRDS("cpn60/filtered.rds")
+filtered_cpn60 <- prune_samples(sample_data(phylo_cpn60)$control == "sample", phylo_cpn60)
+filtered_cpn60 <- prune_taxa(taxa_sums(filtered_cpn60) > 0, filtered_cpn60)
+csts_data <- read.csv("csts.csv", header = T, sep = ",")
+```
+
+```{r}
+my_tax_aggregate <- function(phylo_obj, rank, top_n){
+    phylo_obj_agg <- phylo_obj %>%
+            tax_fix(unknowns = c("Clostridiales_bacterium")) %>%
+            tax_transform("identity", rank = rank)
+    tax <- as.data.frame(tax_table(phylo_obj_agg))
+    rownames(tax) <- taxa_names(phylo_obj_agg)
+    taxa_names(phylo_obj_agg) <- as.character(tax[, rank]) 
+    phylo_obj_agg_RA <- transform_sample_counts(phylo_obj_agg, function(x) x / sum(x))
+    ra_table <- (otu_table(phylo_obj_agg_RA))
+    raw_table <- (otu_table(phylo_obj_agg))
+    if (taxa_are_rows(phylo_obj_agg_RA) == TRUE) {
+        ra_table <- t(ra_table)
+        raw_table <- t(raw_table)
+    }
+    mean_rel_abund <- colMeans(ra_table)
+    top_n_taxa_names <- names(sort(mean_rel_abund, decreasing = TRUE))[1:top_n]
+
+    abund_top_n <- raw_table[, top_n_taxa_names]
+    
+    abund_other <- rowSums(raw_table[, !(colnames(raw_table) %in% top_n_taxa_names)])
+    abund_final <- as.data.frame(abund_top_n)
+    abund_final$Other <- abund_other 
+    abund_final$ID <- rownames(abund_final)
+    return(abund_final)
+}
+```
+
+```{r}
+genus_raw <- my_tax_aggregate(phylo_obj = filtered_16s, rank= "genus", top_n = 10)
+species_raw <- my_tax_aggregate(phylo_obj = filtered_16s, rank= "species", top_n = 25)
+species_lact_cris <- species_raw %>% select(Lactobacillus_crispatus, ID)
+genus_combined <- inner_join(genus_raw, species_lact_cris, by = "ID") 
+
+genus_combined <- genus_combined %>% 
+                    mutate(Lactobacillus_other = Lactobacillus - Lactobacillus_crispatus) %>%
+                    select(-Lactobacillus)
+rownames(genus_combined) <- genus_combined$ID
+genus_combined <- genus_combined %>% select(-ID)
+
+genus_combined <- genus_combined + 0.001
+genus_combined_ra <- t(apply(genus_combined, 1, function(x) x / sum(x)))
+
+sample_info <- data.frame(sample_data(filtered_cpn60))
+sample_info <- inner_join(sample_info, csts_data, by="ID")
+sample_info$CST_16S <- as.factor(sample_info$CST_16S)
+
+annotation_col <- data.frame(
+  PCT_Status = sample_info$pct,
+  pathology = sample_info$pathology, 
+  Vaginal_pH = as.numeric(sample_info$mean_pH),
+  Age = as.numeric(sample_info$age),
+  BMI = as.numeric(sample_info$bmi_english),
+  Previous_use_of_HRT = as.factor(sample_info$hrt),
+  Years_post_menopause = as.numeric(sample_info$postmeno_yrs),
+  CST = sample_info$CST_16S
+)
+rownames(annotation_col) <- sample_info$ID
+annotation_col$pathology <- factor(annotation_col$pathology, 
+                            c("Benign", "Polyp", "Atrophic", "Atrophic+polyp", "Proliferative+polyp",
+                "Proliferative", "Proliferative/EH" , "No biopsy"),
+                            c("No biopsy", "Polyp", "Atrophic", "Atrophic+polyp", "Proliferative+polyp",
+                "Proliferative", "Proliferative/EH" , "No biopsy"))
+
+color_pal_pathology <- c("Polyp" = "purple",
+                "Atrophic" = "green", "Atrophic+polyp" = "blue", "Proliferative+polyp" = "orange",
+                "Proliferative" = "pink", "Proliferative/EH" = "red", "No biopsy" = "white")
+
+annotation_colors <- list(
+  PCT_Status = c("-PCT_1" = "#1b9e77", "+PCT_1" = "#d95f02", "+PCT_2" = "#7570b3", "No PCT"="grey"),
+  pathology = color_pal_pathology,
+  Vaginal_pH = colorRampPalette(c("yellow", "orange", "red"))(20), 
+  Years_post_menopause = colorRampPalette(c("lightblue", "darkblue"))(20), 
+  CST = c("1" = "#1f78b4","2" = "#33a02c", "3" = "#e31a1c", "4" = "#ff7f00"))
+
+
+abund_scaled <- scale(genus_combined_ra)
+dist_samples <- vegan::vegdist(genus_combined_ra, method = "jaccard")
+hc_samples <- hclust(dist_samples, method = "average")
+
+
+heatmap_16S_lac_agg <- pheatmap::pheatmap(t(genus_combined_ra),  
+         cluster_rows = TRUE,       
+         cluster_cols = hc_samples,
+         annotation_col = annotation_col,
+         annotation_colors = annotation_colors, 
+         show_colnames = TRUE,
+         show_rownames = TRUE,
+         main = "16S rRNA",fontsize = 18,
+         fontsize_row = 16,
+         fontsize_col = 10)
+
+```
+
+```{r}
+ps_genus <- filtered_16s %>%
+        subset_samples(pct %in% c("-PCT_1", "+PCT_1", "+PCT_2")) %>%
+          tax_fix(unknowns = c("Clostridiales_bacterium")) %>%
+          tax_transform("identity", rank = "genus")
+
+ps_rel <- transform_sample_counts(ps_genus, function(x) x / sum(x))
+abund_mat <- otu_table(ps_rel)
+
+if(taxa_are_rows(abund_mat)) {
+  abund_mat <- t(abund_mat)
+}
+
+mean_rel_abund <- colMeans(abund_mat)
+top5_genera_names <- names(sort(mean_rel_abund, decreasing = TRUE))[1:15]
+abund_top5 <- abund_mat[, top5_genera_names]
+
+abund_other <- rowSums(abund_mat[, !(colnames(abund_mat) %in% top5_genera_names)])
+abund_final_ra <- as.data.frame(abund_top5)
+abund_final_ra$Other <- abund_other 
+abund_scaled <- scale(abund_final_ra)
+
+sample_info <- data.frame(sample_data(ps_rel))
+sample_info <- inner_join(sample_info, csts_data, by="ID")
+sample_info$CST_16S <- as.factor(sample_info$CST_16S)
+
+annotation_col <- data.frame(
+  PCT_Status = sample_info$pct,
+  pathology = sample_info$pathology, 
+  Vaginal_pH = as.numeric(sample_info$mean_pH),
+  Age = as.numeric(sample_info$age),
+  BMI = as.numeric(sample_info$bmi_english),
+  Previous_use_of_HRT = as.factor(sample_info$hrt),
+  Years_post_menopause = as.numeric(sample_info$postmeno_yrs),
+  CST = sample_info$CST_16S
+)
+rownames(annotation_col) <- sample_info$ID
+annotation_col$pathology <- factor(annotation_col$pathology, 
+                            c("Benign", "Polyp", "Atrophic", "Atrophic+polyp", "Proliferative+polyp",
+                "Proliferative", "Proliferative/EH" , "No biopsy"),
+                            c("No biopsy", "Polyp", "Atrophic", "Atrophic+polyp", "Proliferative+polyp",
+                "Proliferative", "Proliferative/EH" , "No biopsy"))
+
+color_pal_pathology <- c("Polyp" = "purple",
+                "Atrophic" = "green", "Atrophic+polyp" = "blue", "Proliferative+polyp" = "orange",
+                "Proliferative" = "pink", "Proliferative/EH" = "red", "No biopsy" = "white")
+
+annotation_colors <- list(
+  PCT_Status = c("-PCT_1" = "#1b9e77", "+PCT_1" = "#d95f02", "+PCT_2" = "#7570b3"),
+  pathology = color_pal_pathology,
+  Vaginal_pH = colorRampPalette(c("yellow", "orange", "red"))(20), 
+  Years_post_menopause = colorRampPalette(c("lightblue", "darkblue"))(20), 
+  CST = c("1" = "#1f78b4","2" = "#33a02c", "3" = "#e31a1c", "4" = "#ff7f00", "5" = "#6a3d9a" ))
+
+
+abund_scaled <- scale(abund_final_ra)
+dist_samples <- vegan::vegdist(abund_final_ra, method = "jaccard")
+hc_samples <- hclust(dist_samples, method = "average")
+
+
+heatmap_16S <- pheatmap::pheatmap(t(abund_final_ra),  
+         cluster_rows = TRUE,       
+         cluster_cols = hc_samples,
+         annotation_col = annotation_col,
+         annotation_colors = annotation_colors, 
+         show_colnames = TRUE,
+         show_rownames = TRUE,
+         main = "16S rRNA",fontsize = 18,
+         fontsize_row = 16,
+         fontsize_col = 10)
+```
+
+```{r}
+genus_raw <- my_tax_aggregate(phylo_obj = filtered_cpn60, rank= "genus", top_n = 10)
+species_raw <- my_tax_aggregate(phylo_obj = filtered_cpn60, rank= "species", top_n = 25)
+species_lact_cris <- species_raw %>% select(`Lactobacillus crispatus`, ID)
+genus_combined <- inner_join(genus_raw, species_lact_cris, by = "ID") 
+
+genus_combined <- genus_combined %>% 
+                    mutate(Lactobacillus_other = Lactobacillus - `Lactobacillus crispatus`) %>%
+                    select(-Lactobacillus)
+rownames(genus_combined) <- genus_combined$ID
+genus_combined <- genus_combined %>% select(-ID)
+
+genus_combined <- genus_combined + 0.001
+genus_combined_ra <- t(apply(genus_combined, 1, function(x) x / sum(x)))
+
+sample_info <- data.frame(sample_data(filtered_cpn60))
+sample_info <- inner_join(sample_info, csts_data, by="ID")
+sample_info$CST_cpn60 <- as.factor(sample_info$CST_cpn60)
+
+annotation_col <- data.frame(
+  PCT_Status = sample_info$pct,
+  pathology = sample_info$pathology, 
+  Vaginal_pH = as.numeric(sample_info$mean_pH),
+  Age = as.numeric(sample_info$age),
+  BMI = as.numeric(sample_info$bmi_english),
+  Previous_use_of_HRT = as.factor(sample_info$hrt),
+  Years_post_menopause = as.numeric(sample_info$postmeno_yrs),
+  CST = sample_info$CST_cpn60
+)
+rownames(annotation_col) <- sample_info$ID
+annotation_col$pathology <- factor(annotation_col$pathology, 
+                            c("Benign", "Polyp", "Atrophic", "Atrophic+polyp", "Proliferative+polyp",
+                "Proliferative", "Proliferative/EH" , "No biopsy"),
+                            c("No biopsy", "Polyp", "Atrophic", "Atrophic+polyp", "Proliferative+polyp",
+                "Proliferative", "Proliferative/EH" , "No biopsy"))
+
+color_pal_pathology <- c("Polyp" = "purple",
+                "Atrophic" = "green", "Atrophic+polyp" = "blue", "Proliferative+polyp" = "orange",
+                "Proliferative" = "pink", "Proliferative/EH" = "red", "No biopsy" = "white")
+
+annotation_colors <- list(
+  PCT_Status = c("-PCT_1" = "#1b9e77", "+PCT_1" = "#d95f02", "+PCT_2" = "#7570b3", "No PCT"="grey"),
+  pathology = color_pal_pathology,
+  Vaginal_pH = colorRampPalette(c("yellow", "orange", "red"))(20), 
+  Years_post_menopause = colorRampPalette(c("lightblue", "darkblue"))(20), 
+  CST = c(
+  "1" = "#1f78b4",  # blue
+  "2" = "#33a02c",  # green
+  "3" = "#e31a1c",  # red
+  "4" = "#ff7f00"))  # orange
+
+abund_scaled <- scale(genus_combined_ra)
+dist_samples <- vegan::vegdist(genus_combined_ra, method = "jaccard")
+hc_samples <- hclust(dist_samples, method = "average")
+
+
+heatmap_cpn60_lac_agg <- pheatmap::pheatmap(t(genus_combined_ra),  
+         cluster_rows = TRUE,       
+         cluster_cols = hc_samples,
+         annotation_col = annotation_col,
+         annotation_colors = annotation_colors, 
+         show_colnames = TRUE,
+         show_rownames = TRUE,
+         main = "cpn60",fontsize = 18,
+         fontsize_row = 16,
+         fontsize_col = 10)
+```
+
+```{r}
+ps_genus <- filtered_cpn60 %>%
+        subset_samples(pct %in% c("-PCT_1", "+PCT_1", "+PCT_2")) %>%
+          tax_fix(unknowns = c("Clostridiales_bacterium")) %>%
+          tax_transform("identity", rank = "genus")
+
+ps_rel <- transform_sample_counts(ps_genus, function(x) x / sum(x))
+abund_mat <- otu_table(ps_rel)
+
+if(taxa_are_rows(abund_mat)) {
+  abund_mat <- t(abund_mat)
+}
+
+mean_rel_abund <- colMeans(abund_mat)
+top5_genera_names <- names(sort(mean_rel_abund, decreasing = TRUE))[1:15]
+abund_top5 <- abund_mat[, top5_genera_names]
+
+abund_other <- rowSums(abund_mat[, !(colnames(abund_mat) %in% top5_genera_names)])
+abund_final_ra <- as.data.frame(abund_top5)
+abund_final_ra$Other <- abund_other 
+abund_scaled <- scale(abund_final_ra)
+
+sample_info <- data.frame(sample_data(ps_rel))
+sample_info <- left_join(sample_info, csts_data, by="ID")
+sample_info$CST_cpn60 <- as.factor(sample_info$CST_cpn60)
+
+annotation_col <- data.frame(
+  PCT_Status = sample_info$pct,
+  pathology = sample_info$pathology, 
+  Vaginal_pH = as.numeric(sample_info$mean_pH),
+  Age = as.numeric(sample_info$age),
+  BMI = as.numeric(sample_info$bmi_english),
+  Previous_use_of_HRT = as.factor(sample_info$hrt),
+  Years_post_menopause = as.numeric(sample_info$postmeno_yrs),
+  CST = sample_info$CST_cpn60
+)
+rownames(annotation_col) <- sample_info$ID
+annotation_col$pathology <- factor(annotation_col$pathology, 
+                            c("Benign", "Polyp", "Atrophic", "Atrophic+polyp", "Proliferative+polyp",
+                "Proliferative", "Proliferative/EH" , "No biopsy"),
+                            c("No biopsy", "Polyp", "Atrophic", "Atrophic+polyp", "Proliferative+polyp",
+                "Proliferative", "Proliferative/EH" , "No biopsy"))
+
+color_pal_pathology <- c("Polyp" = "purple",
+                "Atrophic" = "green", "Atrophic+polyp" = "blue", "Proliferative+polyp" = "orange",
+                "Proliferative" = "pink", "Proliferative/EH" = "red", "No biopsy" = "white")
+
+annotation_colors <- list(
+  PCT_Status = c("-PCT_1" = "#1b9e77", "+PCT_1" = "#d95f02", "+PCT_2" = "#7570b3"),
+  pathology = color_pal_pathology,
+  Vaginal_pH = colorRampPalette(c("yellow", "orange", "red"))(20), 
+  Years_post_menopause = colorRampPalette(c("lightblue", "darkblue"))(20), 
+  CST = c(
+  "1" = "#1f78b4",  # blue
+  "2" = "#33a02c",  # green
+  "3" = "#e31a1c",  # red
+  "4" = "#ff7f00"
+))
+
+abund_scaled <- scale(abund_final_ra)
+dist_samples <- vegan::vegdist(abund_final_ra, method = "jaccard")
+hc_samples <- hclust(dist_samples, method = "average")
+
+
+heatmap_cpn60 <- pheatmap::pheatmap(t(abund_final_ra),  
+         cluster_rows = TRUE,       
+         cluster_cols = hc_samples,
+         annotation_col = annotation_col,
+         annotation_colors = annotation_colors, 
+         show_colnames = TRUE,
+         show_rownames = TRUE,
+         main = "cpn60",
+         fontsize_row = 16,fontsize = 18,
+         fontsize_col = 10)
+```
+
+```{r}
+# Convert pheatmap to grob
+heatmap_16S_grob <- heatmap_16S$gtable
+heatmap_cpn60_grob <- heatmap_cpn60$gtable
+
+# Convert to ggplot object
+p16 <- as.ggplot(heatmap_16S_grob)
+p60 <- as.ggplot(heatmap_cpn60_grob)
+
+# Extract legends (cowplot)
+legend_16 <- cowplot::get_legend(p16)
+legend_60 <- cowplot::get_legend(p60)
+
+# Remove legends from heatmaps for clean panel
+p16_clean <- p16 + theme(legend.position = "none")
+p60_clean <- p60 + theme(legend.position = "none")
+
+# Combine with legends at bottom
+final_plot <- (p16_clean | p60_clean) /
+  (cowplot::plot_grid(legend_16, legend_60, ncol = 2))
+
+
+```

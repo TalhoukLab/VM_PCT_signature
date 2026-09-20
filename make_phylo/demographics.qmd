@@ -1,0 +1,49 @@
+This script will generate a demophraphics table for aim 3. This data is from the RESToRE clinical trial and only looks at inviduals who submited vagianl swabs.
+
+Importing cpn60 phyloseq as it contains all inviduals of interest
+
+```{r}
+library(gtsummary)
+library(dplyr)
+```
+
+```{r}
+metadata <- read.csv("metadata.csv", header = TRUE, sep = "\t")
+metadata <- metadata %>% filter(control == "sample", 
+                                pct %in% c("-PCT_1", "+PCT_1", "No PCT"))
+metadata$mean_pH <- as.numeric(as.character(metadata$mean_pH))
+
+metadata$pct <- factor(
+  metadata$pct,
+  levels = c("-PCT_1", "+PCT_1", "No PCT")  # or your actual group names
+)
+```
+
+```{r}
+tbl <- metadata %>%
+  select(age, bmi_english, menarche, menopause_age, postmeno_yrs, ethnicity,contraceptives, 
+          hrt, metabolic_conditions, gyne_conditions, 
+          other_coniditions, vaginal_bleeding, Colorectal.cancer,Breast.cancer,
+          Thyroid.cancer,Other.cancers, cancers, mean_pH, pct) %>%
+  tbl_summary(
+    by = pct,
+     type = list(mean_pH ~ "continuous",
+                menarche ~ "continuous"),
+    statistic = list(
+      all_continuous() ~ "{median} [{p25}, {p75}]",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    missing = "ifany"
+  ) %>%
+  add_overall(last = TRUE) %>%
+  add_p(
+    test = list(
+      all_continuous() ~ "kruskal.test",
+      all_categorical() ~ "fisher.test"
+    )
+  ) %>%
+  bold_labels()
+
+
+
+```

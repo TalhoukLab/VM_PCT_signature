@@ -1,0 +1,831 @@
+```{r}
+library(tidyverse)
+library(caret)
+library(glmnet)
+library(pROC)
+library(phyloseq)
+library(vip)
+library(microViz)
+library(mice)
+library(themis)
+library(janitor)
+library(kernelshap)
+library(shapviz)
+library(patchwork)  
+```
+
+```{r}
+customSummary <- function(data, lev = NULL, model = NULL) {
+  confusion <- confusionMatrix(data$pred, data$obs, positive = "positive")
+  sens <- unname(confusion$byClass["Sensitivity"])
+  spec <- unname(confusion$byClass["Specificity"])
+  ppv  <- unname(confusion$byClass["Pos Pred Value"])
+  npv  <- unname(confusion$byClass["Neg Pred Value"])
+  f1_score <- 2 * ((ppv * sens) / (ppv + sens))
+  roc_auc <- tryCatch(
+    pROC::auc(pROC::roc(data$obs, data$positive, quiet = TRUE, direction = "<")),
+    error = function(e) return(0.5))
+  out <- c(
+    ROC = roc_auc, F1 = f1_score,
+    Accuracy = confusion$overall["Accuracy"],
+    Kappa = confusion$overall["Kappa"],
+    Sens = sens, Spec = spec, PPV = ppv, NPV = npv)
+  return(out)
+}
+
+generate_ci <- function(pred, threshold, alpha = 0.05) {
+  pred <- pred %>% dplyr::mutate(pred = case_when(
+    positive >= threshold ~ "positive",
+    TRUE ~ "negative"
+  ))
+  pred$pred <- as.factor(pred$pred)
+
+  dat <- data.frame(
+    pred %>%
+      group_by(Resample) %>%
+      group_modify(~ as.data.frame(t(customSummary(.x)))) %>%
+      ungroup()
+  )
+
+  generate_ci_fun <- function(x) {
+    if (!is.numeric(x)) return(c(NA, NA))
+    lower <- quantile(x, probs = alpha / 2, na.rm = TRUE)
+    upper <- quantile(x, probs = 1 - alpha / 2, na.rm = TRUE)
+    ci <- c(lower, upper); names(ci) <- c("2.5%", "97.5%"); return(ci)
+  }
+
+  ci_results <- sapply(dat, generate_ci_fun)
+  return(as.data.frame(ci_results))
+}
+```
+
+```{r}
+phylo_cpn60 <- readRDS("cpn60/filtered.rds")
+filtered_cpn60 <- prune_samples(sample_data(phylo_cpn60)$control == "sample", phylo_cpn60)
+filtered_cpn60 <- prune_samples(sample_data(filtered_cpn60)$pct %in% c("+PCT_1", "-PCT_1"), filtered_cpn60)
+filtered_cpn60 <- prune_taxa(taxa_sums(filtered_cpn60) > 0, filtered_cpn60)
+
+unfiltered_cpn60 <- readRDS("cpn60/unfiltered.rds")
+unfiltered_cpn60 <- prune_samples(sample_data(unfiltered_cpn60)$control == "sample", unfiltered_cpn60)
+unfiltered_cpn60 <- prune_samples(sample_data(unfiltered_cpn60)$pct %in% c("+PCT_1", "-PCT_1"), unfiltered_cpn60)
+
+phylo_16s <- readRDS("16S/filtered_silva.rds")
+filtered_16s <- prune_samples(sample_data(phylo_16s)$control == "sample", phylo_16s)
+filtered_16s <- prune_samples(sample_data(filtered_16s)$pct %in% c("+PCT_1", "-PCT_1"), filtered_16s)
+filtered_16s <- prune_taxa(taxa_sums(filtered_16s) > 0, filtered_16s)
+
+unfiltered_16S <- readRDS("16S/unfiltered_silva.rds")
+unfiltered_16S <- prune_samples(sample_data(unfiltered_16S)$control == "sample", unfiltered_16S)
+unfiltered_16S <- prune_samples(sample_data(unfiltered_16S)$pct %in% c("+PCT_1", "-PCT_1"), unfiltered_16S)
+```
+
+```{r}
+my_tax_aggregate <- function(phylo_obj, rank, top_n) {
+  phylo_obj_agg <- phylo_obj %>%
+    tax_fix(unknowns = c("Clostridiales_bacterium")) %>%
+    tax_transform("identity", rank = rank)
+  tax <- as.data.frame(tax_table(phylo_obj_agg))
+  rownames(tax) <- taxa_names(phylo_obj_agg)
+  taxa_names(phylo_obj_agg) <- as.character(tax[, rank])
+  phylo_obj_agg_RA <- transform_sample_counts(phylo_obj_agg, function(x) x / sum(x))
+  ra_table  <- otu_table(phylo_obj_agg_RA)
+  raw_table <- otu_table(phylo_obj_agg)
+  if (taxa_are_rows(phylo_obj_agg_RA)) {
+    ra_table  <- t(ra_table)
+    raw_table <- t(raw_table)
+  }
+  mean_rel_abund   <- colMeans(ra_table)
+  top_n_taxa_names <- names(sort(mean_rel_abund, decreasing = TRUE))[1:top_n]
+  abund_top_n      <- raw_table[, top_n_taxa_names]
+  abund_other      <- rowSums(raw_table[, !(colnames(raw_table) %in% top_n_taxa_names)])
+  abund_final      <- as.data.frame(abund_top_n)
+  abund_final$Other <- abund_other
+  abund_final$ID    <- rownames(abund_final)
+  return(abund_final)
+}
+
+clr_transform <- function(x) {
+  log_x <- log(x)
+  gmean_log <- mean(log_x)
+  return(log_x - gmean_log)
+}
+
+clr_transform_comp <- function(data) {
+  data_ra  <- data + 0.001
+  data_ra  <- t(apply(data_ra, 1, function(x) x / sum(x)))
+  data_clr <- apply(data_ra, 1, clr_transform)
+  return(data_clr)
+}
+```
+
+```{r}
+# ── CLR-transformed taxa features for both marker genes ──────────────────────
+clr_df <- function(raw_df, suffix) {
+  ids <- raw_df$ID
+  mat <- raw_df %>% select(-ID, -Other) %>% as.matrix()
+  clr <- data.frame(t(clr_transform_comp(as.data.frame(mat))))
+  clr$ID <- ids
+  clr <- janitor::clean_names(clr)
+  clr <- clr %>% rename_with(~ paste0(., suffix), -id)
+  return(clr)
+}
+
+n_genus_cpn60   <- ntaxa(tax_glom(filtered_cpn60, "genus"))
+n_species_cpn60 <- ntaxa(tax_glom(filtered_cpn60, "species"))
+n_genus_16s     <- ntaxa(tax_glom(filtered_16s,   "genus"))
+n_species_16s   <- ntaxa(tax_glom(filtered_16s,   "species"))
+
+genus_raw_cpn60_all   <- my_tax_aggregate(filtered_cpn60, rank = "genus",   top_n = n_genus_cpn60)
+species_raw_cpn60_all <- my_tax_aggregate(filtered_cpn60, rank = "species", top_n = n_species_cpn60)
+genus_raw_16s_all     <- my_tax_aggregate(filtered_16s,   rank = "genus",   top_n = n_genus_16s)
+species_raw_16s_all   <- my_tax_aggregate(filtered_16s,   rank = "species", top_n = n_species_16s)
+
+genus_clr_cpn60   <- clr_df(genus_raw_cpn60_all,   suffix = "_g_cpn60")
+species_clr_cpn60 <- clr_df(species_raw_cpn60_all, suffix = "_s_cpn60")
+genus_clr_16s     <- clr_df(genus_raw_16s_all,     suffix = "_g_16s")
+species_clr_16s   <- clr_df(species_raw_16s_all,   suffix = "_s_16s")
+```
+
+```{r}
+# ── Lactobacillus / crispatus ratio features vs other genera ─────────────────
+to_ra <- function(raw_df) {
+  ids <- raw_df$ID
+  mat <- raw_df %>% select(-ID) %>% as.matrix()
+  ra  <- mat / rowSums(mat)
+  data.frame(ra, ID = ids)
+}
+
+# cpn60 ratios
+ra_genus_cpn60   <- to_ra(genus_raw_cpn60_all)
+ra_species_cpn60 <- to_ra(species_raw_cpn60_all)
+
+lacto_cpn60 <- ra_genus_cpn60$Lactobacillus
+crisp_cpn60 <- ra_species_cpn60$Lactobacillus.crispatus
+other_genera_cpn60 <- ra_genus_cpn60 %>% select(-ID, -Lactobacillus, -Other)
+
+ratios_cpn60 <- map_dfc(colnames(other_genera_cpn60), function(tax) {
+  denom <- other_genera_cpn60[[tax]] + 1e-6
+  tibble(
+    "lacto_vs_{tax}_cpn60" := lacto_cpn60 / denom,
+    "crisp_vs_{tax}_cpn60" := crisp_cpn60 / denom
+  )
+})
+ratios_cpn60$ID <- ra_genus_cpn60$ID
+
+# 16S ratios
+ra_genus_16s   <- to_ra(genus_raw_16s_all)
+ra_species_16s <- to_ra(species_raw_16s_all)
+
+lacto_16s <- ra_genus_16s$Lactobacillus
+crisp_16s <- ra_species_16s$Lactobacillus_crispatus
+other_genera_16s <- ra_genus_16s %>% select(-ID, -Lactobacillus, -Other)
+
+ratios_16s <- map_dfc(colnames(other_genera_16s), function(tax) {
+  denom <- other_genera_16s[[tax]] + 1e-6
+  tibble(
+    "lacto_vs_{tax}_16s" := lacto_16s / denom,
+    "crisp_vs_{tax}_16s" := crisp_16s / denom
+  )
+})
+ratios_16s$ID <- ra_genus_16s$ID
+
+ratios_cpn60 <- janitor::clean_names(ratios_cpn60) %>% rename(id = id)
+ratios_16s   <- janitor::clean_names(ratios_16s)   %>% rename(id = id)
+```
+
+```{r}
+# ── PICRUSt2 functional predictions (currently excluded from final join) ─────
+ko_raw <- read.table(
+  "16S/qiime/picrust2_out_pipeline/KO_metagenome_out/pred_metagenome_unstrat.tsv.gz",
+  header = TRUE, sep = "\t", row.names = 1, check.names = FALSE
+)
+ec_raw <- read.table(
+  "16S/qiime/picrust2_out_pipeline/EC_metagenome_out/pred_metagenome_unstrat.tsv.gz",
+  header = TRUE, sep = "\t", row.names = 1, check.names = FALSE
+)
+
+ko_t <- as.data.frame(t(ko_raw))
+ec_t <- as.data.frame(t(ec_raw))
+
+clr_transform_picrust <- function(mat) {
+  mat     <- mat + 1e-6
+  mat     <- mat / rowSums(mat)
+  log_mat <- log(mat)
+  gm      <- rowMeans(log_mat)
+  sweep(log_mat, 1, gm, "-")
+}
+
+ko_clr <- as.data.frame(clr_transform_picrust(ko_t)); ko_clr$id <- rownames(ko_clr)
+ec_clr <- as.data.frame(clr_transform_picrust(ec_t)); ec_clr$id <- rownames(ec_clr)
+
+ko_clr <- janitor::clean_names(ko_clr) %>% rename_with(~ paste0(., "_ko"), -id)
+ec_clr <- janitor::clean_names(ec_clr) %>% rename_with(~ paste0(., "_ec"), -id)
+
+cat("KO samples:", nrow(ko_clr), "\n")
+cat("EC samples:", nrow(ec_clr), "\n")
+```
+
+```{r}
+
+p <- plot_richness(unfiltered_cpn60, measures = c("Shannon"), x = "pct")
+meta_subset <- p$data %>%
+  dplyr::select("ID", "age", "bmi_english", "menopause_age", "postmeno_yrs",
+                "menarche", "metabolic_conditions", "gyne_conditions",
+                "other_coniditions", "vaginal_bleeding", "cancers", "hrt",
+                "mean_pH", "pct", "value") %>%
+  dplyr::rename(bmi = bmi_english,
+                other_conditions = other_coniditions,
+                alpha_diversity_cpn60 = value,
+                id = ID)
+
+p_16s <- plot_richness(unfiltered_16S, measures = c("Shannon"), x = "pct")
+meta_subset_16s <- p_16s$data %>%
+  dplyr::select("ID", "value") %>%
+  dplyr::rename(alpha_diversity_16S = value, id = ID)
+
+meta_subset_remove_other_condidtions <- meta_subset %>% dplyr::select(-other_conditions)
+all_metadata <- read.csv("metadata.csv", header = T, sep = ",")
+all_metadata_selected <- all_metadata %>% dplyr::select(Participant_PPID, Osteoporosis, Arthritis, Hepatic.impairment.or.disease)
+colnames(all_metadata_selected) <- c("id", "Osteoporosis", "Arthritis", "Hepatic.impairment.or.disease")
+all_metadata_selected <- janitor::clean_names(all_metadata_selected)
+all_metadata_selected$osteoporosis <- factor(all_metadata_selected$osteoporosis, levels = c("Unchecked", "Checked"), labels = c(0, 1))
+all_metadata_selected$arthritis <- factor(all_metadata_selected$arthritis, levels = c("Unchecked", "Checked"), labels = c(0, 1))
+all_metadata_selected$hepatic_impairment_or_disease <- factor(all_metadata_selected$hepatic_impairment_or_disease, levels = c("Unchecked", "Checked"), labels = c(0, 1))
+all_metadata_selected$id <- paste0(all_metadata_selected$id, "-1")
+meta_subset <- inner_join(meta_subset_remove_other_condidtions, all_metadata_selected, by = "id") 
+```
+
+```{r}
+
+
+lacto_clr_cpn60 <- genus_clr_cpn60   %>% select(id, lactobacillus_g_cpn60)
+lacto_clr_16s   <- genus_clr_16s     %>% select(id, lactobacillus_g_16s)
+crisp_clr_cpn60 <- species_clr_cpn60 %>% select(id, lactobacillus_crispatus_s_cpn60)
+crisp_clr_16s   <- species_clr_16s   %>% select(id, lactobacillus_crispatus_s_16s)
+
+standardize <- function(x) (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+
+clinical_z <- meta_subset %>%
+  select(id, age, bmi, postmeno_yrs, menarche) %>%
+  mutate(across(c(age, bmi, postmeno_yrs, menarche),
+                standardize,
+                .names = "{.col}_z")) %>%
+  select(id, ends_with("_z")) %>%
+  mutate(across(ends_with("_z"), ~ ifelse(is.na(.), 0, .)))
+
+interaction_features <- lacto_clr_cpn60 %>%
+  inner_join(lacto_clr_16s,   by = "id") %>%
+  inner_join(crisp_clr_cpn60, by = "id") %>%
+  inner_join(crisp_clr_16s,   by = "id") %>%
+  inner_join(clinical_z,      by = "id") %>%
+  mutate(
+    # Lactobacillus genus × clinical  (cpn60)
+    lacto_x_age_cpn60      = lactobacillus_g_cpn60 * age_z,
+    lacto_x_bmi_cpn60      = lactobacillus_g_cpn60 * bmi_z,
+    lacto_x_postmeno_cpn60 = lactobacillus_g_cpn60 * postmeno_yrs_z,
+    lacto_x_menarche_cpn60 = lactobacillus_g_cpn60 * menarche_z,
+    # Lactobacillus genus × clinical  (16S)
+    lacto_x_age_16s        = lactobacillus_g_16s * age_z,
+    lacto_x_bmi_16s        = lactobacillus_g_16s * bmi_z,
+    lacto_x_postmeno_16s   = lactobacillus_g_16s * postmeno_yrs_z,
+    lacto_x_menarche_16s   = lactobacillus_g_16s * menarche_z,
+    # L. crispatus × clinical  (cpn60)
+    crisp_x_age_cpn60      = lactobacillus_crispatus_s_cpn60 * age_z,
+    crisp_x_bmi_cpn60      = lactobacillus_crispatus_s_cpn60 * bmi_z,
+    crisp_x_postmeno_cpn60 = lactobacillus_crispatus_s_cpn60 * postmeno_yrs_z,
+    crisp_x_menarche_cpn60 = lactobacillus_crispatus_s_cpn60 * menarche_z,
+    # L. crispatus × clinical  (16S)
+    crisp_x_age_16s        = lactobacillus_crispatus_s_16s * age_z,
+    crisp_x_bmi_16s        = lactobacillus_crispatus_s_16s * bmi_z,
+    crisp_x_postmeno_16s   = lactobacillus_crispatus_s_16s * postmeno_yrs_z,
+    crisp_x_menarche_16s   = lactobacillus_crispatus_s_16s * menarche_z
+  ) %>%
+  select(id, starts_with("lacto_x_"), starts_with("crisp_x_"))
+
+cat("Interaction features built:", ncol(interaction_features) - 1, "\n")
+cat("Sample size in interactions:", nrow(interaction_features), "\n")
+```
+
+```{r}
+# ── Final feature-matrix assembly ────────────────────────────────────────────
+full_feature_df <- meta_subset 
+
+rownames(full_feature_df) <- full_feature_df$id
+full_feature_df <- full_feature_df %>% select(-id) %>% janitor::clean_names()
+#full_feature_df <- full_feature_df %>% dplyr::select(-alpha_diversity_16s)
+full_feature_df <- full_feature_df %>% dplyr::select(-alpha_diversity_cpn60)
+
+full_feature_df$gyne_conditions      <- factor(full_feature_df$gyne_conditions,      levels = c("0","1"))
+full_feature_df$metabolic_conditions <- factor(full_feature_df$metabolic_conditions, levels = c("0","1"))
+#full_feature_df$other_conditions     <- factor(full_feature_df$other_conditions,     levels = c("0","1"))
+full_feature_df$vaginal_bleeding     <- factor(full_feature_df$vaginal_bleeding,     levels = c("0","1"))
+full_feature_df$hrt <- factor(full_feature_df$hrt,
+  levels = c("No", "Yes", "I prefer not to answer"),
+  labels = c("0", "1", "1"))
+full_feature_df$pct <- factor(
+  case_when(
+    full_feature_df$pct %in% c("positive", "+PCT_1") ~ "positive",
+    TRUE ~ "negative"
+  ),
+  levels = c("negative", "positive")
+)
+
+cat("Class balance:\n"); print(table(full_feature_df$pct))
+#full_feature_df <- full_feature_df %>% dplyr::select(-alpha_diversity_16s)
+#full_feature_df <- full_feature_df %>% dplyr::select(-alpha_diversity_cpn60)
+
+#stopifnot("alpha_diversity_cpn60" %in% names(full_feature_df))
+#stopifnot("alpha_diversity_16s"   %in% names(full_feature_df))
+#cat("Alpha diversity columns confirmed present\n")
+
+nzv_idx <- nearZeroVar(full_feature_df %>% select(-pct))
+if (length(nzv_idx) > 0) {
+  cat("Removing", length(nzv_idx), "near-zero variance features\n")
+  full_feature_df <- full_feature_df[, -nzv_idx]
+}
+
+full_feature_df <- full_feature_df[, colSums(is.na(full_feature_df)) == 0]
+
+# Confirm interactions survived NZV + NA filtering
+int_surviving <- grep("^lacto_x_|^crisp_x_", names(full_feature_df), value = TRUE)
+cat("Interaction features retained after NZV/NA filtering:",
+    length(int_surviving), "of 16\n")
+print(int_surviving)
+
+cat("Final feature count (excl. outcome):", ncol(full_feature_df) - 1, "\n")
+cat("Sample size:", nrow(full_feature_df), "\n")
+```
+
+```{r}
+# ── STAGE 1: CV loop with within-fold feature selection ──────────────────────
+set.seed(2025)
+outcome_var      <- "pct"
+all_features_exp <- setdiff(names(full_feature_df), outcome_var)
+y_full           <- full_feature_df$pct
+
+TOP_N   <- 15     # raised from 10 to give interactions a fair shot
+K_FOLDS <- 5
+N_REPS  <- 20
+
+cv_folds <- createMultiFolds(y_full, k = K_FOLDS, times = N_REPS)
+
+fold_selected_features <- vector("list", length(cv_folds))
+fold_metrics           <- vector("list", length(cv_folds))
+
+for (i in seq_along(cv_folds)) {
+  cat("Fold", i, "of", length(cv_folds), "\n")
+
+  train_idx <- cv_folds[[i]]
+  test_idx  <- setdiff(seq_len(nrow(full_feature_df)), train_idx)
+
+  train_df  <- full_feature_df[train_idx, ]
+  test_df   <- full_feature_df[test_idx, ]
+
+  # SMOTE/upsample on train fold only
+  train_smote <- upSample(
+    x     = train_df %>% select(-pct),
+    y     = train_df$pct,
+    yname = "pct"
+  )
+
+  X_train_s <- train_smote %>% select(-pct)
+  y_train_s <- train_smote$pct
+
+  # Step 1: tune RF on ALL features in train fold
+  fold_ctrl_tune <- trainControl(
+    method          = "cv",
+    number          = 3,
+    classProbs      = TRUE,
+    summaryFunction = customSummary,
+    sampling        = NULL
+  )
+
+  rf_tune_grid_fold <- expand.grid(
+    mtry          = seq(1, length(all_features_exp), 1),
+    splitrule     = "gini",
+    min.node.size = c(1, 5, 10)
+  )
+
+  fold_rf_all <- train(
+    x          = X_train_s,
+    y          = y_train_s,
+    method     = "ranger",
+    metric     = "F1",
+    trControl  = fold_ctrl_tune,
+    importance = "permutation",
+    tuneGrid   = rf_tune_grid_fold
+  )
+
+  # Step 2: permutation importance → top TOP_N features
+  imp <- varImp(fold_rf_all, scale = TRUE)$importance
+  imp$Feature <- rownames(imp)
+  top_features <- imp %>%
+    arrange(desc(Overall)) %>%
+    slice_head(n = TOP_N) %>%
+    pull(Feature) %>%
+    gsub("1$", "", .)
+
+  fold_selected_features[[i]] <- top_features
+
+  # Step 3: refit RF on top features only
+  top_in_train <- intersect(top_features, colnames(X_train_s))
+  rf_tune_grid_top <- expand.grid(
+    mtry          = seq(1, max(1, length(top_in_train)), by = 1),
+    splitrule     = "gini",
+    min.node.size = c(1, 5, 10)
+  )
+
+  fold_rf_top <- train(
+    x         = X_train_s[, top_in_train],
+    y         = y_train_s,
+    method    = "ranger",
+    metric    = "F1",
+    trControl = fold_ctrl_tune,
+    tuneGrid  = rf_tune_grid_top
+  )
+
+  # Step 4: evaluate on held-out test fold
+  top_in_test <- intersect(top_in_train, colnames(test_df))
+  probs <- predict(fold_rf_top,
+                   newdata = test_df[, top_in_test],
+                   type    = "prob")[, "positive"]
+  preds <- factor(ifelse(probs > 0.5, "positive", "negative"),
+                  levels = c("negative", "positive"))
+
+  cm  <- confusionMatrix(preds, test_df$pct, positive = "positive")
+  auc <- tryCatch(
+    as.numeric(pROC::auc(pROC::roc(test_df$pct, probs,
+                                   quiet = TRUE, direction = "<"))),
+    error = function(e) NA
+  )
+
+  fold_metrics[[i]] <- data.frame(
+    fold  = i,
+    AUROC = auc,
+    Sens  = unname(cm$byClass["Sensitivity"]),
+    Spec  = unname(cm$byClass["Specificity"]),
+    PPV   = unname(cm$byClass["Pos Pred Value"]),
+    NPV   = unname(cm$byClass["Neg Pred Value"])
+  )
+}
+
+cat("CV loop complete\n")
+```
+
+```{r}
+# ── Stability analysis ───────────────────────────────────────────────────────
+all_selected  <- unlist(fold_selected_features)
+n_folds_total <- length(cv_folds)
+STABILITY_THRESHOLD <- 0.20  # selected in ≥10% of folds
+
+selection_df <- data.frame(
+  Feature    = names(sort(table(all_selected), decreasing = TRUE)),
+  Count      = as.numeric(sort(table(all_selected), decreasing = TRUE)),
+  Proportion = as.numeric(sort(table(all_selected), decreasing = TRUE)) / n_folds_total
+)
+
+stable_features <- selection_df %>%
+  filter(Proportion >= STABILITY_THRESHOLD) %>%
+  pull(Feature)
+
+cat("\nStable features (selected in ≥", STABILITY_THRESHOLD * 100, "% of folds):\n", sep = "")
+print(stable_features)
+cat("N stable features:", length(stable_features), "\n")
+
+# Flag which stable features are interaction terms
+cat("\nOf which are interaction terms:\n")
+print(grep("^lacto_x_|^crisp_x_", stable_features, value = TRUE))
+
+# Stability plot
+selection_df %>%
+  slice_head(n = 40) %>%
+  mutate(
+    stable     = Proportion >= STABILITY_THRESHOLD,
+    is_interaction = grepl("^lacto_x_|^crisp_x_", Feature)
+  ) %>%
+  ggplot(aes(x = Proportion,
+             y = reorder(Feature, Proportion),
+             fill = stable)) +
+  geom_col() +
+  geom_point(aes(shape = is_interaction),
+             x = -0.005, size = 1.5, show.legend = TRUE) +
+  scale_shape_manual(values = c("FALSE" = NA, "TRUE" = 17),
+                     labels = c(" ", "Interaction term"),
+                     name = NULL) +
+  scale_fill_manual(values = c("FALSE" = "#CCCCCC", "TRUE" = "#7F77DD"),
+                    labels = c("Below threshold", "Stable (≥10%)"),
+                    name = NULL) +
+  labs(x = "Selection frequency across CV folds", y = NULL,
+       title = "Feature stability — expanded feature set with interactions") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+```
+
+```{r}
+# ── Stage 1 metrics summary across folds ─────────────────────────────────────
+metrics_df <- do.call(rbind, fold_metrics)
+
+metrics_summary <- metrics_df %>%
+  summarise(across(c(AUROC, Sens, Spec, PPV, NPV), list(
+    mean  = ~ round(mean(.,  na.rm = TRUE), 3),
+    lower = ~ round(quantile(., 0.025, na.rm = TRUE), 3),
+    upper = ~ round(quantile(., 0.975, na.rm = TRUE), 3)
+  )))
+
+print(metrics_summary)
+```
+
+```{r}
+# ── STAGE 2: Refit on stable features with proper repeated CV ────────────────
+if (length(stable_features) == 0) {
+  warning("No features passed ", STABILITY_THRESHOLD*100,
+          "% threshold — lower threshold or increase TOP_N")
+}
+
+stable_features_formula <- as.formula(
+  paste("pct ~", paste(stable_features, collapse = " + "))
+)
+
+rf_tune_grid_stable <- expand.grid(
+  mtry          = seq(1, length(stable_features), by = 1),
+  splitrule     = "gini",
+  min.node.size = seq(1, 20, by = 2)
+)
+
+model_cv_control_stable <- trainControl(
+  method          = "repeatedcv",
+  number          = 5,
+  repeats         = 20,
+  classProbs      = TRUE,
+  summaryFunction = customSummary,
+  savePredictions = "final",
+  sampling        = "smote",
+  allowParallel   = TRUE
+)
+
+set.seed(2025)
+final_model_stable <- train(
+  stable_features_formula,
+  data      = full_feature_df,
+  method    = "ranger",
+  metric    = "F1",
+  trControl = model_cv_control_stable,
+  tuneGrid  = rf_tune_grid_stable,
+  importance = "permutation"
+)
+
+best <- final_model_stable$bestTune
+
+final_metrics_stable <- final_model_stable$results %>%
+  filter(
+    mtry          == best$mtry,
+    splitrule     == best$splitrule,
+    min.node.size == best$min.node.size
+  ) %>%
+  select(ROC, F1, Sens, Spec, PPV, NPV) %>%
+  mutate(across(everything(), ~ round(., 3)))
+
+print(final_metrics_stable)
+
+generate_ci(final_model_stable$pred, 0.5)
+```
+
+```{r}
+# ── Threshold optimization (closest to (0,1) corner) ─────────────────────────
+cv_predictions <- final_model_stable$pred
+
+cv_data <- cv_predictions %>%
+  dplyr::select(obs, positive) %>%
+  mutate(obs = factor(obs, levels = c("negative", "positive")))
+
+thresholds <- seq(0.01, 0.99, by = 0.01)
+
+calculate_distance <- function(thresh) {
+  predicted_class <- factor(
+    ifelse(cv_data$positive > thresh, "positive", "negative"),
+    levels = c("negative", "positive")
+  )
+  cm <- confusionMatrix(predicted_class, cv_data$obs, positive = "positive")
+  sens <- cm$byClass["Sensitivity"]
+  spec <- cm$byClass["Specificity"]
+  ppv  <- cm$byClass["Pos Pred Value"]
+  npv  <- cm$byClass["Neg Pred Value"]
+  f1   <- 2 * ((ppv * sens) / (ppv + sens))
+  TPR  <- sens
+  FPR  <- 1 - spec
+  distance <- sqrt(FPR^2 + (TPR - 1)^2)
+  roc_auc <- tryCatch(
+    pROC::auc(pROC::roc(cv_data$obs, cv_data$positive,
+                        quiet = TRUE, direction = "<")),
+    error = function(e) return(0.5))
+  data.frame(
+    Threshold = thresh, F1 = f1, ROC = roc_auc, Distance = distance,
+    Sensitivity = TPR, Specificity = spec, FPR = FPR, PPV = ppv, NPV = npv
+  )
+}
+
+distance_results <- do.call(rbind, lapply(thresholds, calculate_distance))
+optimal_threshold_row <- distance_results %>% arrange(Distance) %>% head(1)
+
+cat("\n========================================================\n")
+cat("      FINAL MODEL METRICS (Closest to (0, 1) Corner)\n")
+cat("========================================================\n")
+cat(paste("Optimal threshold:", round(optimal_threshold_row$Threshold, 3), "\n"))
+cat(paste("Euclidean distance:", round(optimal_threshold_row$Distance, 3), "\n"))
+cat("--------------------------------------------------------\n")
+
+final_metrics_distance <- optimal_threshold_row %>%
+  dplyr::select(Threshold, Distance, F1, ROC, Sensitivity, Specificity, PPV, NPV) %>%
+  mutate(across(where(is.numeric), ~ round(., 3)))
+
+print("Metrics at optimal threshold:")
+ci_tbl <- generate_ci(final_model_stable$pred, optimal_threshold_row$Threshold)
+lo <- ci_tbl[1, ]   # 2.5%
+hi <- ci_tbl[2, ]   # 97.5%
+
+fmt <- function(est, l, h) sprintf("%.2f [%.2f, %.2f]", est, l, h)
+
+summary_tbl <- tibble::tibble(
+  Metric = c("AUROC", "NPV", "Sensitivity", "PPV", "Specificity"),
+  Value  = c(
+    fmt(final_metrics_distance$ROC,         lo[["ROC"]],  hi[["ROC"]]),
+    fmt(final_metrics_distance$NPV,         lo[["NPV"]],  hi[["NPV"]]),
+    fmt(final_metrics_distance$Sensitivity, lo[["Sens"]], hi[["Sens"]]),
+    fmt(final_metrics_distance$PPV,         lo[["PPV"]],  hi[["PPV"]]),
+    fmt(final_metrics_distance$Specificity, lo[["Spec"]], hi[["Spec"]])
+  )
+)
+print(summary_tbl, n = Inf)
+```
+
+```{r}
+feature_labels <- c(
+  "age" = "age",
+  "bmi" = "BMI",
+  "cancers" = "previous history of cancers",
+  "gyne_conditions" = "presence of gynecological conditions",
+  "hepatic_impairment_or_disease" = "presence of hepatic impairment or disease",
+  "hrt" = "previous use of HRT",
+  "menarche" = "age at menarche",
+  "menopause_age" = "age at menopause",
+  "metabolic_conditions" = "presence of metabolic conditions",
+  "osteoporosis" = "presence of osteoporosis",
+  "postmeno_yrs" = "years postmenopause",
+  "vaginal_bleeding" = "history of vaginal bleeding"
+)
+
+relabel <- function(x) ifelse(is.na(feature_labels[x]), x, feature_labels[x])
+
+
+# ── SHAP interpretation ──────────────────────────────────────────────────────
+pred_fun <- function(model, newdata) {
+  as.numeric(predict(model, newdata = newdata, type = "prob")[, "positive"])
+}
+
+set.seed(42)
+bg_sample <- full_feature_df[
+  sample(nrow(full_feature_df), min(nrow(full_feature_df), 50)), , drop = FALSE
+]
+
+data_df_scaled <- full_feature_df %>% dplyr::select(all_of(stable_features))
+
+shap_results <- kernelshap(
+  object   = final_model_stable,
+  X        = data_df_scaled,
+  bg_X     = bg_sample,
+  pred_fun = pred_fun
+)
+
+sv <- shapviz(shap_results)
+colnames(sv) <- relabel(colnames(sv))
+
+shap_plot <- sv_importance(
+  sv,
+  kind        = "beeswarm",
+  max_display = length(stable_features)
+) +
+  ggtitle("SHAP feature importance") +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.y  = element_text(size = 13),
+    axis.text.x  = element_text(size = 12),
+    axis.title   = element_text(size = 13),
+    plot.title   = element_text(size = 15)
+  )
+
+
+rf_imp_df <- varImp(final_model_stable, scale = FALSE)$importance %>%
+  tibble::rownames_to_column("Feature") %>%
+  dplyr::rename(Importance = Overall) %>%
+  dplyr::mutate(Feature = relabel(Feature)) %>%
+  dplyr::arrange(dplyr::desc(Importance))
+
+rf_plot <- ggplot(rf_imp_df,
+                  aes(x = Importance, y = reorder(Feature, Importance))) +
+  geom_segment(aes(x = 0, xend = Importance,
+                   yend = reorder(Feature, Importance)),
+               color = "#187ac5ff", linewidth = 0.6) +
+  geom_point(color = "#187ac5ff", size = 3) +
+  labs(x = "Permutation importance", y = NULL,
+       title = "Random forest permutation importance") +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.y = element_text(size = 13),
+    axis.text.x = element_text(size = 12),
+    axis.title  = element_text(size = 13),
+    plot.title  = element_text(size = 15)
+  )
+
+
+combined <- shap_plot + rf_plot + plot_layout(ncol = 2)
+
+```
+
+```{r}
+# ── Misclassification analysis with Lactobacillus dominance labels ───────────
+cv_predictions <- final_model_stable$pred %>%
+  mutate(
+    pred_class = factor(
+      ifelse(positive >= optimal_threshold_row$Threshold, "positive", "negative"),
+      levels = c("negative", "positive")
+    ),
+    correct       = pred_class == obs,
+    misclassified = pred_class != obs,
+    error_type    = case_when(
+      obs == "positive" & pred_class == "negative" ~ "False Negative",
+      obs == "negative" & pred_class == "positive" ~ "False Positive",
+      TRUE                                          ~ "Correct"
+    )
+  )
+
+sample_error_summary <- cv_predictions %>%
+  group_by(rowIndex) %>%
+  summarise(
+    n_folds            = n(),
+    n_correct          = sum(correct),
+    n_misclassified    = sum(misclassified),
+    pct_misclassified  = round(mean(misclassified) * 100, 1),
+    true_label         = first(obs),
+    n_false_neg        = sum(error_type == "False Negative"),
+    n_false_pos        = sum(error_type == "False Positive"),
+    mean_prob_positive = round(mean(positive), 3),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(pct_misclassified))
+
+labels_df <- read.csv("lacto_domin.csv")
+colnames(labels_df) <- c("ID", "m_16S", "m_cpn60")
+
+sample_error_summary <- sample_error_summary %>%
+  mutate(ID = rownames(full_feature_df)[rowIndex])
+
+misclass_annotated <- sample_error_summary %>%
+  left_join(labels_df, by = "ID") %>%
+  arrange(desc(pct_misclassified))
+
+misclass_annotated %>%
+  filter(pct_misclassified > 0) %>%
+  select(ID, true_label, pct_misclassified,
+         n_false_neg, n_false_pos, mean_prob_positive) %>%
+  print(n = Inf)
+
+misclass_plot <- misclass_annotated %>%
+  filter(pct_misclassified > 0) %>%
+  mutate(
+    ID = factor(ID, levels = ID[order(pct_misclassified)]),
+    lacto_16s = case_when(
+      m_16S == "yes"     ~ "Dominant",
+      m_16S == "maybe"   ~ "Maybe",
+      m_16S == "missing" ~ "Missing",
+      TRUE               ~ "Not dominant"
+    ),
+    lacto_cpn60 = case_when(
+      m_cpn60 == "yes" ~ "Dominant",
+      TRUE             ~ "Not dominant"
+    )
+  ) %>%
+  pivot_longer(
+    cols      = c(lacto_16s, lacto_cpn60),
+    names_to  = "marker_gene",
+    values_to = "lacto_status"
+  ) %>%
+  mutate(marker_gene = case_when(
+    marker_gene == "lacto_16s"   ~ "16S",
+    marker_gene == "lacto_cpn60" ~ "cpn60"
+  )) %>%
+  ggplot(aes(x = pct_misclassified, y = ID, fill = lacto_status)) +
+  geom_col() +
+  scale_fill_manual(
+    values = c("Dominant" = "#2ECC71", "Maybe" = "#F39C12",
+               "Not dominant" = "#E74C3C", "Missing" = "#AAAAAA"),
+    name = "Lactobacillus dominance"
+  ) +
+  facet_grid(true_label ~ marker_gene, scales = "free_y") +
+  labs(x = "% folds misclassified", y = NULL,
+       title = "Misclassification rate by Lactobacillus dominance") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom",
+        strip.text = element_text(face = "bold"))
+
+```

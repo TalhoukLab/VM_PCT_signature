@@ -1,0 +1,39 @@
+```{r}
+library(phyloseq)
+library(ggplot2)
+library(dplyr)
+library(Biostrings)
+```
+
+```{r}
+phylo_16s <- readRDS("16S/filtered_silva.rds")
+filtered_16s <- prune_samples(sample_data(phylo_16s)$control == "sample", phylo_16s)
+filtered_16s <- prune_samples(sample_data(filtered_16s)$pct %in% c("+PCT_1", "-PCT"), filtered_16s)
+filtered_16s <- prune_taxa(taxa_sums(filtered_16s) > 0, filtered_16s)
+all_seqs <- readDNAStringSet("16S/qiime/asvs.fasta")
+```
+
+```{r}
+names(all_seqs) <- gsub(" .*", "", names(all_seqs))  
+asv_ids <- taxa_names(filtered_16s)
+
+matched_seqs <- all_seqs[names(all_seqs) %in% asv_ids]
+cat("Found", length(matched_seqs), "matching sequences out of", length(asv_ids), "ASVs in phyloseq.\n")
+
+writeXStringSet(matched_seqs, filepath = "16S/qiime/filtered_ASVs_picrust.fna", format = "fasta")
+
+
+otu_mat <- as.data.frame(otu_table(filtered_16s))
+if(taxa_are_rows(filtered_16s)) {
+  otu_df <- otu_mat
+} else {
+  otu_df <- t(otu_mat) 
+}
+
+otu_df <- otu_df[rownames(otu_df) %in% names(matched_seqs), ]
+
+# PICRUSt2 expects tab-separated file, with ASV IDs as first column
+otu_out <- cbind(ASV_ID = rownames(otu_df), otu_df)
+write.table(otu_out, "picrust2_input_table.tsv", sep = "\t", quote = FALSE, row.names = FALSE)
+
+```

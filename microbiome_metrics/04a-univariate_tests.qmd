@@ -1,0 +1,206 @@
+ANOSIM
+
+```{r}
+library(microViz)
+library(vegan)
+```
+
+```{r}
+phylo_16s <- readRDS("16S/filtered_silva.rds")
+filtered_16s <- prune_samples(sample_data(phylo_16s)$control == "sample", phylo_16s)
+filtered_16s <- prune_taxa(taxa_sums(filtered_16s) > 0, filtered_16s)
+filtered_16s <- prune_samples(sample_data(filtered_16s)$pct %in% c("-PCT_1", "+PCT_1"), filtered_16s)
+
+phylo_cpn60 <- readRDS("cpn60/filtered.rds")
+filtered_cpn60 <- prune_samples(sample_data(phylo_cpn60)$control == "sample", phylo_cpn60)
+filtered_cpn60 <- prune_taxa(taxa_sums(filtered_cpn60) > 0, filtered_cpn60)
+filtered_cpn60 <- prune_samples(sample_data(filtered_cpn60)$pct %in% c("-PCT_1", "+PCT_1"), filtered_cpn60)
+
+```
+
+```{r}
+generate_dist_grid_allvars <- function(ps_obj,
+                                       vars,
+                                       ranks = c("unique", "genus", "species"),
+                                       dists = c("euclidean", "bray", "jaccard", "jsd", "unifrac", "wunifrac")) {
+  
+  all_results <- list()
+  
+  for (var in vars) {
+    message("Processing ANOSIM for grouping variable: ", var)
+   
+    
+    for (rank in ranks) {
+      for (dist in dists) {
+        
+        message("  Rank: ", rank, " | Distance: ", dist)
+        
+        # Transform appropriately for each distance
+        if (dist %in% c("bray", "jaccard", "jsd")) {
+          ps_rank <- ps_obj %>%
+            tax_fix(unknowns = c("Clostridiales_bacterium")) %>%
+            tax_transform("identity", rank = rank)
+        } else if (dist == "euclidean") {
+          ps_rank <- ps_obj %>%
+            tax_fix(unknowns = c("Clostridiales_bacterium")) %>%
+            tax_transform("identity", rank = rank)
+        } else if (dist %in% c("unifrac", "wunifrac")) {
+          ps_rank <- ps_obj %>%
+            tax_fix(unknowns = c("Clostridiales_bacterium")) %>%
+            tax_transform("identity", rank = "unique")
+        }
+        
+        # Distance matrix
+        dist_mat <- phyloseq::distance(ps_rank, method = dist)
+
+       
+        anosim_res <- anosim(dist_mat,
+                             grouping = sample_data(ps_rank)[[var]],
+                             permutations = 999)
+        
+        # Store results
+        all_results[[paste(var, rank, dist, sep = "_")]] <- data.frame(
+          Variable = var,
+          Rank = rank,
+          Distance = dist,
+          R = anosim_res$statistic,
+          P = anosim_res$signif
+        )
+      }
+    }
+  }
+  
+  # Combine into one dataframe
+  anosim_df <- do.call(rbind, all_results)
+  rownames(anosim_df) <- NULL
+  
+  return(anosim_df)
+}
+
+#use <- c("pct", "age", "bmi_english", "menopause_age", "menarche", "postmeno_yrs", "ethnicity",
+#       "contraceptives", "hrt",
+#        "metabolic_conditions",  "gyne_conditions", "other_coniditions", "vaginal_bleeding",
+#        "Colorectal.cancer",  "Breast.cancer", "Thyroid.cancer", "Other.cancers", "risk_score_bc")
+
+use <- c("pct", "age", "bmi_english", "menopause_age", "menarche", "postmeno_yrs", "ethnicity",
+       "contraceptives", "hrt",
+        "metabolic_conditions",  "gyne_conditions", "other_coniditions", "vaginal_bleeding",
+        "Colorectal.cancer",  "Breast.cancer", "Thyroid.cancer", "Other.cancers")
+
+anosim_results_16S_all <- generate_dist_grid_allvars(ps_obj = filtered_16s, vars = use)
+anosim_results_16S_all_copy <- anosim_results_16S_all
+anosim_results_cpn60_all <- generate_dist_grid_allvars(filtered_cpn60, use)
+anosim_results_cpn60_all_copy <- anosim_results_cpn60_all
+```
+
+```{r, fig.height=10, fig.width=20}
+library(ggplot2)
+anosim_results_16S_all_copy$Variable <- factor(anosim_results_16S_all_copy$Variable, 
+                                               levels = c("pct", "age", "bmi_english", "menopause_age", "menarche", "postmeno_yrs", "ethnicity",
+                                                        "contraceptives", "hrt",
+                                                        "metabolic_conditions",  "gyne_conditions",
+                                                          "other_coniditions", "vaginal_bleeding",
+                                                          "Colorectal.cancer",  "Breast.cancer", "Thyroid.cancer", "Other.cancers"),
+                                              labels = c("PCT", "Age", "BMI", "Age at menopause", "Age at menarche", "Years postmenopause", "Ethnicity",
+                                                         "Previous use of contraceptives (n=48 (98%))", 
+                                                         "Previous use of HRT (n=8 (16.3%))", 
+                                                         "Metabolic conditions (n=24 (49%))",  
+                                                         "Gyne conditions (n=12 (24.5%))", 
+                                                         "Other coniditions (n=23 (46.9%))", 
+                                                         "History of vaginal bleeding (n=11 (22.4%))",
+                                                         "Colorectal cancer (n=1 (2%))",  
+                                                         "Breast cancer (n=2 (2%))", 
+                                                         "Thyroid cancer (n=2 (4.1%))", 
+                                                         "Other cancers (n=4 (8.2%))"))
+
+
+
+anosim_results_16S_all_copy$type <- "16S rRNA"
+anosim_results_16S_all_copy <- anosim_results_16S_all_copy %>% filter(Rank %in% c("genus", "species"))
+
+anosim_results_cpn60_all_copy$Variable <- factor(anosim_results_cpn60_all_copy$Variable, 
+                                               levels = c("pct", "age", "bmi_english", "menopause_age", "menarche", "postmeno_yrs", "ethnicity",
+                                                        "contraceptives", "hrt",
+                                                        "metabolic_conditions",  "gyne_conditions",
+                                                          "other_coniditions", "vaginal_bleeding",
+                                                          "Colorectal.cancer",  "Breast.cancer", "Thyroid.cancer", "Other.cancers"),
+                                              labels = c("PCT", "Age", "BMI", "Age at menopause", "Age at menarche", "Years postmenopause", "Ethnicity",
+                                                         "Previous use of contraceptives (n=49 (98%))", 
+                                                         "Previous use of HRT (n=8 (16.3%))", 
+                                                         "Metabolic conditions (n=24 (48%))",  
+                                                         "Gyne conditions (n=12 (24%))", 
+                                                         "Other coniditions (n=24 (48%))", 
+                                                         "History of vaginal bleeding (n=11 (22%))",
+                                                         "Colorectal cancer (n=1 (2%))",  
+                                                         "Breast cancer (n=2 (2%))", 
+                                                         "Thyroid cancer (n=2 (4%))", 
+                                                         "Other cancers (n=4 (8%))"))
+
+anosim_results_cpn60_all_copy$type <- "cpn60"
+anosim_results_cpn60_all_copy <- anosim_results_cpn60_all_copy %>% filter(Rank %in% c("genus", "species"))
+
+all <- rbind(anosim_results_16S_all_copy, anosim_results_cpn60_all_copy)
+```
+
+```{r, fig.height=10, fig.width=20}
+
+#pdf("univariate_tests_species_only_before_16s.pdf", width = 20, height = 10)
+a <- anosim_results_16S_all_copy %>% 
+filter(Rank %in% c("species")) %>%
+ggplot( aes(x = Distance, y = forcats::fct_rev(Variable), fill = R)) +
+  geom_tile(color = "grey80") +
+  geom_text(aes(label = paste0(signif(R, 2))), color = "black", size = 5.5) +
+  # Add black border for significant p-values
+  geom_tile(data = subset(anosim_results_16S_all_copy %>% filter(Rank %in% c("species")), P < 0.05),
+            aes(x = Distance, y = forcats::fct_rev(Variable)),
+            color = "black", fill = NA, linewidth = 1) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, limits = c(-0.5, 1)) +
+  facet_grid(Rank ~ type) +  
+  theme_minimal(base_size = 20) +
+  theme(
+    axis.text.x = element_text(size = 20, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 20),
+    axis.title.x = element_text(size = 21, face = "bold"),
+    axis.title.y = element_text(size = 21, face = "bold"),
+    legend.title = element_text(size = 21, face = "bold"),
+    legend.text = element_text(size = 20),
+    strip.text = element_text(size = 20, face = "bold")  # bigger facet titles
+  )  + ylab("") + xlab("")
+#dev.off()
+```
+
+```{r, fig.height=10, fig.width=20}
+
+#pdf("univariate_tests_species_only_before_cpn60.pdf", width = 20, height = 10)
+b <- anosim_results_cpn60_all_copy %>% 
+filter(Rank %in% c("species")) %>%
+ggplot( aes(x = Distance, y = forcats::fct_rev(Variable), fill = R)) +
+  geom_tile(color = "grey80") +
+  geom_text(aes(label = paste0(signif(R, 2))), color = "black", size = 5.5) +
+  # Add black border for significant p-values
+  geom_tile(data = subset(anosim_results_cpn60_all_copy %>% filter(Rank %in% c("species")), P < 0.05),
+            aes(x = Distance, y = forcats::fct_rev(Variable)),
+            color = "black", fill = NA, linewidth = 1) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0,limits = c(-0.5, 1)) +
+  facet_grid(Rank ~ type) +  
+  theme_minimal(base_size = 20) +
+  theme(
+    axis.text.x = element_text(size = 20, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 20),
+    axis.title.x = element_text(size = 21, face = "bold"),
+    axis.title.y = element_text(size = 21, face = "bold"),
+    legend.title = element_text(size = 21, face = "bold"),
+    legend.text = element_text(size = 20),
+    strip.text = element_text(size = 20, face = "bold")  # bigger facet titles
+  )  + ylab("") + xlab("")
+#dev.off()
+```
+
+```{r}
+library(patchwork)
+
+pdf("univariate_tests_species_only_before.pdf", width = 28, height = 10)
+(a | b) + plot_layout(guides = "collect") + 
+    plot_annotation(tag_levels = "A")
+dev.off()
+```
